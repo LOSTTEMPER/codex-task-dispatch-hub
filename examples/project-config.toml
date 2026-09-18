@@ -1,0 +1,5 @@
+# Copy this file to <your-project>/.codex/config.toml.
+# Relative paths are resolved from the .codex directory for project config.
+# Codex only loads project configuration after the project is trusted.
+
+experimental_compact_prompt_file = "../config/compact-prompt.md"

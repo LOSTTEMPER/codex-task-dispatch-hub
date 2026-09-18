@@ -1,0 +1,27 @@
+{
+  "members": [
+    {
+      "role": "manager",
+      "thread_id": "replace-with-manager-thread-id",
+      "label": "Coordinator",
+      "scope": "Owns team goals, version planning, dependency decisions, and final review."
+    },
+    {
+      "role": "backend",
+      "thread_id": "replace-with-backend-thread-id",
+      "label": "Backend",
+      "scope": "Owns backend implementation and service contracts."
+    },
+    {
+      "role": "frontend",
+      "thread_id": "replace-with-frontend-thread-id",
+      "label": "Frontend",
+      "scope": "Owns frontend implementation and user-facing behavior."
+    }
+  ],
+  "onboarding": {
+    "version": "team-onboarding-v1",
+    "title": "Dispatch hub onboarding",
+    "goal": "Bind each existing conversation to one collaboration role and verify hub begin/end handling."
+  }
+}

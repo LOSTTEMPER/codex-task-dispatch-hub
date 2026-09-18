@@ -1,0 +1,12 @@
+[project]
+name = "codex-task-dispatch-hub"
+version = "0.1.0"
+description = "Local, model-free task routing for persistent Codex conversations"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "LOSTTEMPER" }]
+keywords = ["codex", "agents", "coordination", "sqlite"]
+
+[project.urls]
+Homepage = "https://github.com/LOSTTEMPER/codex-task-dispatch-hub"
+Repository = "https://github.com/LOSTTEMPER/codex-task-dispatch-hub"
