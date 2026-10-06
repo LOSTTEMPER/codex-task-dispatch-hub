@@ -4,14 +4,25 @@ return (async () => {
   const hub = typeof hubPath === "string" && hubPath ? hubPath : "./hub.py";
   const quote = value => "'" + String(value).replace(/'/g, "'\\''") + "'";
   const call = async (op, args) => {
-    const response = await tools.exec_command({
+    let response = await tools.exec_command({
       cmd: "PYTHONDONTWRITEBYTECODE=1 python3 " + quote(hub) + " call " + quote(op) + " --json " + quote(JSON.stringify(args)),
       max_output_tokens: 6500
     });
+    let output = response.output || "";
+    const deadline = Date.now() + 90000;
+    while (response.session_id) {
+      if (Date.now() >= deadline || typeof tools.write_stdin !== "function") {
+        throw new Error("中枢命令仍在运行，账本结果待核对，禁止重领或重发");
+      }
+      response = await tools.write_stdin({ session_id: response.session_id,
+        chars: "", yield_time_ms: 1000, max_output_tokens: 6500 });
+      output += response.output || "";
+      if (output.length > 200000) throw new Error("中枢输出超限，账本结果待核对");
+    }
     let value;
-    try { value = JSON.parse(response.output); }
-    catch { throw new Error("中枢返回格式错误，未进行原生投递"); }
-    if (!value.ok) throw new Error(value.error);
+    try { value = JSON.parse(output); }
+    catch { throw new Error("中枢返回不完整或截断，账本结果待核对"); }
+    if (response.exit_code !== 0 || !value.ok) throw new Error(value.error || "中枢命令未正常结束，账本结果待核对");
     return value.result;
   };
   const decode = result => {
@@ -20,6 +31,37 @@ return (async () => {
     if (!block) throw new Error("原生工具未返回状态");
     return JSON.parse(block.text);
   };
+  // Read only bounded native user-message records. A newer UUID or idle status
+  // alone never establishes which turn belongs to this delivery.
+  const findSentTurn = async (threadId, message, pages = 1) => {
+    if (typeof tools.mcp__codex_app__read_thread !== "function") return null;
+    let cursor;
+    for (let page = 0; page < pages; page++) {
+      const read = decode(await tools.mcp__codex_app__read_thread({ threadId, turnLimit: 5,
+        includeOutputs: false, maxOutputCharsPerItem: Math.min(16000, message.length + 100),
+        ...(cursor ? { cursor } : {}) }));
+      if (read.thread?.id !== threadId || !Array.isArray(read.turns)) throw new Error("原生历史目标未知");
+      const matches = read.turns.filter(turn => typeof turn.id === "string" && turn.items?.some(item =>
+        item.type === "userMessage" && Array.isArray(item.content) &&
+        item.content.filter(part => part.type === "text").map(part => part.text).join("\n") === message));
+      if (matches.length > 1) throw new Error("原消息对应多个轮次，须人工核对");
+      if (matches.length === 1) return matches[0].id;
+      cursor = read.page?.nextCursor;
+      if (!cursor || !read.page?.hasMore) break;
+    }
+    return null;
+  };
+  if (operation === "delivery_link_native") {
+    const keys = ["delivery_id", "expected_thread_id"];
+    if (!payload || Object.keys(payload).some(key => !keys.includes(key)) ||
+        keys.some(key => typeof payload[key] !== "string" || !payload[key])) throw new Error("核对只接收投递和目标编号");
+    const ticket = await call("delivery_link_native_prepare", payload);
+    const actual = await findSentTurn(ticket.thread_id, ticket.message, 3);
+    if (!actual) return { result: { linked: false, error: "有界原生历史未找到原消息，保留投递，禁止重发" } };
+    return { result: await call("delivery_link_native_commit", { ...payload, token: ticket.token,
+      proof: { thread_id: ticket.thread_id, turn_id: actual, user_message: ticket.message } }) };
+  }
+  if (operation.startsWith("delivery_link_native_")) throw new Error("内部关联步骤须经原生入口");
   let operationResult;
   let reconcileTarget;
   if (operation === "delivery_reconcile_native") {
@@ -100,6 +142,7 @@ return (async () => {
     if (item.thread_id === batch.calling_thread_id) continue;
     if (reconcileTarget && item.thread_id !== reconcileTarget) continue;
     let claimed;
+    let claimAttempted = false;
     try {
       const status = decode(await tools.mcp__codex_app__wait_threads({
         targets: [{ threadId: item.thread_id }], timeoutMs: 0
@@ -110,6 +153,7 @@ return (async () => {
         outcomes.push({ delivery_id: item.delivery_id, state: "waiting_for_current_turn" });
         continue;
       }
+      claimAttempted = true;
       claimed = await call("delivery_claim_native", { delivery_id: item.delivery_id });
       if (claimed.skipped) {
         outcomes.push({ delivery_id: item.delivery_id, state: claimed.state });
@@ -125,16 +169,22 @@ return (async () => {
         targets: [{ threadId: claimed.thread_id }], timeoutMs: 0
       }));
       const actual = after.polls?.find(p => p.thread?.id === claimed.thread_id);
+      let actualTurn = sent.turnId || sent.turn?.id;
+      if (!actualTurn) {
+        try { actualTurn = await findSentTurn(claimed.thread_id, claimed.message); }
+        catch { /* Confirmed receipt remains recorded; bounded recovery is explicit. */ }
+      }
       await call("delivery_receipt_native", { delivery_id: item.delivery_id, confirmed: true,
-        turn_id: actual?.thread?.status?.type === "active" ? actual?.latestTurn?.id : undefined });
+        ...(actualTurn ? { turn_id: actualTurn } : {}) });
       outcomes.push({ delivery_id: item.delivery_id, thread_id: claimed.thread_id,
-        state: actual?.thread?.status?.type, turn_id: actual?.latestTurn?.id });
+        state: actual?.thread?.status?.type || "delivered", turn_id: actualTurn,
+        ...(actualTurn ? {} : { needs_turn_link: true }) });
     } catch (error) {
       if (claimed) {
         try { await call("delivery_receipt_native", { delivery_id: item.delivery_id, confirmed: false }); }
         catch { /* Keep uncertain/sending for reconciliation; never blind retry. */ }
       }
-      outcomes.push({ delivery_id: item.delivery_id, state: claimed ? "uncertain" : "pending", error: String(error) });
+      outcomes.push({ delivery_id: item.delivery_id, state: claimAttempted ? "uncertain" : "pending", error: String(error) });
     }
   }
   return { result: operationResult, delivery: outcomes };

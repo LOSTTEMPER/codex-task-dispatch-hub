@@ -213,7 +213,13 @@ class Budgets:
         if not identifiers:
             return {'managed': False, 'note': '本轮未纳管；不会追溯扣除旧任务用量'}
         identifier = next(iter(identifiers))
-        self.owned(role, identifier)
+        b = self.owned(role, identifier)
+        run = self.db.execute('SELECT version FROM runs WHERE id=?', (run_id,)).fetchone()
+        if not run or b['version'] != run['version']:
+            raise ValueError('预算须属于本轮版本')
+        self.h.version(b['version'])
+        if b['state'] in ('closed','stopped'):
+            raise ValueError('已终止预算不能绑定新工作')
         if source and source['turn_id'] and not source['turn_ended']:
             self.bind_turn(tid, source['turn_id'], identifier, self.account(identifier)['version'], started=source['turn_started'])
         self.db.execute('INSERT INTO budget_runs(run_id,budget_id) VALUES(?,?) ON CONFLICT(run_id) DO NOTHING', (run_id, identifier))
@@ -266,12 +272,12 @@ class Budgets:
     def reconcile(self):
         for row in self.db.execute("SELECT * FROM outbox WHERE kind LIKE 'budget_%' AND state='pending'").fetchall():
             p = json.loads(row['payload']);b = self.account(p['budget_id'])
-            stale = p.get('budget_revision') != b['revision']
+            stale = p.get('budget_revision') != b['revision'] or b['state'] == 'closed'
             if row['kind'] in ACTIVE_NOTICES:
                 stale = stale or b['state'] in ('closed','stopped','awaiting_decision')
             if row['kind'] == 'budget_review':
                 c = self.db.execute('SELECT state,revision FROM budget_reviews WHERE id=?', (p['review_id'],)).fetchone()
-                stale = not c or c['state'] != 'open' or c['revision'] != p['review_revision']
+                stale = stale or not c or c['state'] != 'open' or c['revision'] != p['review_revision']
             if stale:
                 self.h.archive_wakeup(row, 'budget_policy_or_review_changed')
 
@@ -308,7 +314,17 @@ class Budgets:
             raise ValueError('评议编号不匹配')
         should_wake = row is None or row['state'] == 'clarification'
         if row:
-            identifier = row['id'];revision = row['revision'] + int(should_wake)
+            old_report = json.loads(row['report'])
+            changed = any(old_report.get(key) != value for key, value in report.items() if key != 'reported_at')
+            identifier = row['id'];revision = row['revision'] + int(should_wake or changed)
+            # Pending notification follows current content; the same notice is
+            # retained instead of waking the manager once per edit.
+            if changed and not should_wake:
+                for notice in self.db.execute("SELECT * FROM outbox WHERE kind='budget_review' AND state='pending'").fetchall():
+                    payload = json.loads(notice['payload'])
+                    if payload.get('review_id') == identifier:
+                        payload['review_revision'] = revision
+                        self.db.execute('UPDATE outbox SET payload=?,updated=? WHERE id=?', (encode(payload), stamp(), notice['id']))
             self.db.execute("UPDATE budget_reviews SET state='open',revision=?,report=?,updated=? WHERE id=?", (revision, encode(report), stamp(), identifier))
         else:
             identifier = 'budget-review-' + uuid.uuid4().hex;revision = 1
@@ -327,6 +343,9 @@ class Budgets:
         if not c:
             raise ValueError('评议不存在')
         b = self.account(c['budget_id'])
+        if b['state'] in ('closed','stopped'):
+            raise ValueError('已终止预算不能由旧评议重新激活')
+        self.h.version(b['version'])
         if b['owner'] == role:
             raise PermissionError('执行者不能自批自己的额度；总管自身任务需用户裁定，不向自己循环申请')
         if c['state'] != 'open' or args.get('expected_revision') != c['revision']:
@@ -446,8 +465,10 @@ class Budgets:
                 self.h.require_manager(role);b = self.account(args['budget_id'])
                 pending = self.db.execute("SELECT 1 FROM budget_requests br JOIN requests r ON r.id=br.request_id WHERE br.budget_id=? AND r.status NOT IN ('done','cancelled','superseded')", (b['id'],)).fetchone()
                 active = self.db.execute('SELECT 1 FROM budget_sources WHERE (inherited_budget=? OR thread_id=?) AND turn_id IS NOT NULL AND turn_ended IS NULL', (b['id'], b['thread_id'])).fetchone()
-                if pending or active:
+                run = self.db.execute('SELECT 1 FROM budget_runs br JOIN runs r ON r.id=br.run_id WHERE br.budget_id=? AND r.ended IS NULL', (b['id'],)).fetchone()
+                if pending or active or run:
                     raise ValueError('任务或后代仍在进行，不能关闭预算')
+                self.db.execute("UPDATE budget_reviews SET state='closed',updated=? WHERE budget_id=? AND state IN ('open','clarification')", (stamp(), b['id']))
                 self.db.execute("UPDATE budgets SET state='closed',updated=? WHERE id=?", (stamp(), b['id']))
                 result = self.view(b['id'])
             else:

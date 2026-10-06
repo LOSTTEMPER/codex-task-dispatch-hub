@@ -122,7 +122,7 @@ class HubTests(unittest.TestCase):
    return {'status':'idle','provider':'openai'}
   ipc=type('IPC',(),{'owner':lambda s,t:'owner','runtime':runtime,
                      'start':lambda *a: self.fail('stale result must not start a turn'),'close':lambda s:None})
-  with patch('worker.DesktopIPC',ipc):self.assertFalse(Worker(self.h).dispatch(row))
+  with patch('worker.DesktopIPC',lambda **kwargs:ipc()):self.assertFalse(Worker(self.h).dispatch(row))
   self.assertEqual(self.h.db.execute('SELECT attempts FROM outbox WHERE id=?',(row['id'],)).fetchone()[0],0)
  def test_worker_sends_review_merged_during_live_lookup(self):
   run=self.start('manager');x=self.req('manager',required_for_review=True)
@@ -139,7 +139,7 @@ class HubTests(unittest.TestCase):
    return {'status':'idle','provider':'openai'}
   ipc=type('IPC',(),{'owner':lambda s,t:'owner','runtime':runtime,
                      'start':lambda s,t,o,message,key:messages.append(message),'close':lambda s:None})
-  with patch('worker.DesktopIPC',ipc):self.assertTrue(Worker(self.h).dispatch(row))
+  with patch('worker.DesktopIPC',lambda **kwargs:ipc()):self.assertTrue(Worker(self.h).dispatch(row))
   self.assertEqual(len(messages),1);self.assertIn('一并决定',messages[0])
   self.assertEqual(self.h.db.execute("SELECT state FROM outbox WHERE kind='review_ready'").fetchone()[0],'archived')
  def test_policy_and_information_records_are_silent(self):
@@ -205,7 +205,7 @@ class HubTests(unittest.TestCase):
   rpc=type('RPC',(),{'notifications':queue.Queue(),'latest_turn':lambda s,t:{'status':'completed'}})()
   ipc=type('IPC',(),{'owner':lambda s,t:'owner','runtime':lambda s,t,o:{'status':'active','provider':'openai'},'close':lambda s:None})
   row=self.h.db.execute('SELECT * FROM outbox LIMIT 1').fetchone()
-  with patch('worker.DesktopIPC',ipc):self.assertFalse(Worker(self.h,rpc).dispatch(row))
+  with patch('worker.DesktopIPC',lambda **kwargs:ipc()):self.assertFalse(Worker(self.h,rpc).dispatch(row))
   self.assertEqual(self.h.db.execute('SELECT attempts FROM outbox WHERE id=?',(row['id'],)).fetchone()[0],0)
  def test_empty_goal_no_wake_or_premature_review(self):
   self.h.version_review('manager',{'decision':'archived','summary':'done'})
@@ -218,7 +218,7 @@ class HubTests(unittest.TestCase):
  def test_no_owner_never_executes_hidden_engine(self):
   row=self.h.db.execute('SELECT * FROM outbox LIMIT 1').fetchone()
   ipc=type('IPC',(),{'owner':lambda s,t:None,'close':lambda s:None})
-  with patch('worker.DesktopIPC',ipc):self.assertFalse(Worker(self.h).dispatch(row))
+  with patch('worker.DesktopIPC',lambda **kwargs:ipc()):self.assertFalse(Worker(self.h).dispatch(row))
   result=self.h.db.execute('SELECT * FROM outbox WHERE id=?',(row['id'],)).fetchone()
   self.assertEqual(result['state'],'pending');self.assertEqual(result['attempts'],0)
   self.assertIn('禁止后台',result['last_error'])
@@ -247,7 +247,7 @@ class HubTests(unittest.TestCase):
   rows=self.h.db.execute("SELECT * FROM outbox WHERE recipient='a' ORDER BY created,id").fetchall()
   ipc=type('IPC',(),{'owner':lambda s,t:'owner','runtime':lambda s,t,o:{'status':'idle','provider':'openai'},'close':lambda s:None})
   worker=Worker(self.h)
-  with patch('worker.DesktopIPC',ipc):
+  with patch('worker.DesktopIPC',lambda **kwargs:ipc()):
    # Simulate another path winning while the worker checks the live owner.
    self.h.call('thread-b','delivery_claim_native',{'delivery_id':rows[0]['id']})
    self.assertFalse(worker.dispatch(rows[1]))

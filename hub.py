@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
+import time
 import uuid
 from budget import Budgets, BUDGET_NOTICES, ACTIVE_NOTICES
 
@@ -131,18 +132,36 @@ class BaseHub:
         """)
 
         self.budgets = Budgets(self)
+        from projections import install
+        install(self)
 
     def close(self):
         self.db.close()
 
     @contextlib.contextmanager
     def transaction(self):
+        if self.db.in_transaction:
+            with self.db_savepoint():
+                yield
+            return
         self.db.execute("BEGIN IMMEDIATE")
         try:
             yield
             self.db.commit()
         except BaseException:
             self.db.rollback()
+            raise
+
+    @contextlib.contextmanager
+    def db_savepoint(self):
+        name = 'nested_' + uuid.uuid4().hex
+        self.db.execute('SAVEPOINT ' + name)
+        try:
+            yield
+            self.db.execute('RELEASE ' + name)
+        except BaseException:
+            self.db.execute('ROLLBACK TO ' + name)
+            self.db.execute('RELEASE ' + name)
             raise
 
     def meta(self, key, default=None):
@@ -237,6 +256,7 @@ class BaseHub:
                 req = self.get_request(identifier)
                 if req["recipient"] != role:
                     raise PermissionError("不能接手其他角色的请求")
+                self.version(req['version'])
                 if req["status"] in TERMINAL:
                     raise ValueError("请求已经结束；勿重复执行: " + identifier)
                 if req["version"] != version:
@@ -313,10 +333,13 @@ class BaseHub:
         self.enqueue(recipient, "request", f"{identifier}:1", {"request_id": identifier}, priority, identifier, version["id"])
         return {"request_id": identifier, "state": "queued", "priority": PRIORITY_NAMES[priority]}
 
-    def _resolve(self, role, identifier, summary, references):
+    def _resolve(self, role, identifier, summary, references, run_version):
         req = self.get_request(identifier)
         if req["recipient"] != role:
             raise PermissionError("只能提交自己收到的协作任务的处理结果")
+        if req['version'] != run_version:
+            raise ValueError('结果请求须属于本轮版本')
+        self.version(req['version'])
         summary = short(summary, "处理结果", 1500)
         references = refs(references)
         if req["status"] == "done":
@@ -344,7 +367,7 @@ class BaseHub:
             if run["ended"]:
                 return {"run_id": identifier, "state": run["state"], "duplicate": True}
             for result in outcomes:
-                self._resolve(role, result["request_id"], result["summary"], result.get("refs", []))
+                self._resolve(role, result["request_id"], result["summary"], result.get("refs", []), run["version"])
             dependencies = args.get("wait_for", [])
             if not isinstance(dependencies, list) or len(dependencies) > 30:
                 raise ValueError("wait_for 须为至多 30 项列表")
@@ -373,7 +396,8 @@ class BaseHub:
                 if not any(sorted(set(json.loads(row["dependencies"]))) == dependencies for row in existing):
                     self.db.execute("INSERT INTO barriers VALUES(?,?,?,?,0)", (identifier, role, run["version"], dump(dependencies)))
                 self._check_cycles()
-            if state in {"submitted", "waiting", "needs_user", "interrupted"}:
+            version_open = not run['version'] or self.version(run['version'], writable=False)['state'] not in {'accepted','archived'}
+            if state in {"submitted", "waiting", "needs_user", "interrupted"} and version_open:
                 self.db.execute("UPDATE version_roles SET state=?,summary=? WHERE version=? AND role=?", (state, summary, run["version"], role))
             for change in args.get("product_updates", []):
                 self._product_update(role, run["version"], change)
@@ -381,25 +405,10 @@ class BaseHub:
         self.render()
         return {"run_id": identifier, "state": state, "saved": True}
 
-    def _check_cycles(self):
-        graph = {}
-        for b in self.db.execute("SELECT * FROM barriers WHERE fired=0"):
-            graph.setdefault(b["role"], set())
-            for identifier in json.loads(b["dependencies"]):
-                r = self.get_request(identifier)
-                if r["status"] not in TERMINAL:
-                    graph[b["role"]].add(r["recipient"])
-        def visit(node, path):
-            if node in path:
-                return True
-            return any(visit(other, path | {node}) for other in graph.get(node, set()))
-        if any(visit(node, set()) for node in graph):
-            # Preserve the waiting facts and ask the manager to make a decision once.
-            fingerprint = hashlib.sha256(dump({k: sorted(v) for k, v in sorted(graph.items())}).encode()).hexdigest()[:20]
-            self.enqueue(MANAGER, "dependency_cycle", "cycle:" + fingerprint, {"summary": "发现相互等待，请读取公共请求并裁定依赖拆分。", "roles": sorted(graph)}, 0, version=self.current())
-
     def evaluate(self):
         for barrier in self.db.execute("SELECT * FROM barriers WHERE fired=0").fetchall():
+            if self.version(barrier['version'], writable=False)['state'] in {'accepted','archived'}:
+                continue
             dependencies = [self.get_request(x) for x in json.loads(barrier["dependencies"])]
             # A withdrawn prerequisite requires attention even if another is still pending.
             failed = any(r["status"] in {"cancelled", "superseded", "blocked"} for r in dependencies)
@@ -434,6 +443,8 @@ class BaseHub:
 
     def reconcile_wakeups(self):
         """Transaction-owned, model-free coalescing, shared by both transports."""
+        for row in self.db.execute("SELECT o.* FROM outbox o JOIN versions v ON v.id=o.version WHERE o.state='pending' AND v.state IN ('accepted','archived')").fetchall():
+            self.archive_wakeup(row, 'version_closed')
         self.budgets.reconcile()
         # Retire uncertain results from explicitly closed versions without
         # pretending they were read and without risking another delivery.
@@ -463,6 +474,7 @@ class BaseHub:
     def update_request(self, role, args):
         with self.transaction():
             req = self.get_request(args["request_id"])
+            self.version(req['version'])
             if role not in {req["sender"], req["recipient"], MANAGER}:
                 raise PermissionError("只能修改与自己相关的协作请求")
             if int(args.get("expected_revision", 0)) != req["revision"]:
@@ -628,37 +640,71 @@ class BaseHub:
         lines.append(NOTIFICATION_POLICY)
         return "\n".join(lines)
 
-    def render(self):
+    def render(self, cancel=None):
         """Atomic projections. Original bodies are not archived; revision notes are."""
+        from projections import batch, PAGE_SIZE
+        if self.db.in_transaction:
+            return
+        def check_cancel():
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError('projection cancelled')
+        check_cancel()
         with open(self.state / "render.lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            docs = self.root / "docs"
-            docs.mkdir(exist_ok=True)
-            def write(relative, body):
-                path = docs / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                if path.exists() and path.read_text() == body: return
-                temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-                temporary.write_text(body, encoding="utf-8")
-                os.replace(temporary, path)
-            current = self.current()
-            index = ["# 团队协作入口", "", "文档版本：v1.0", "", "仅用于团队共享与协作，不替代项目记忆或线程私有执行记录。", "", f"当前版本：{current or '尚未启动'}", "", "## 当前版本与历史索引", ""]
-            for v in self.db.execute("SELECT * FROM versions ORDER BY created DESC"):
-                index.append(f"- [{v['title']}](versions/{v['id']}/overview.md)：{v['state']}；{v['goal']}")
-                overview = [f"# {v['title']}", "", f"项目版本：{v['id']}；文档版本：v1.0；状态：{v['state']}", "", "## 总目标", "", v["goal"], "", "## 交付分工", ""]
-                for row in self.db.execute("SELECT * FROM version_roles WHERE version=? ORDER BY role", (v["id"],)):
-                    overview.append(f"- [{row['role']}](../../roles/{row['role']}.md)：{row['state']}。{row['summary']}")
-                overview += ["", "## 共享资料索引", ""]
-                for d in self.db.execute("SELECT key,title,revision,owner FROM documents WHERE version=?", (v["id"],)):
-                    overview.append(f"- [{d['title']}](../../documents/{d['key']}.md)：v1.{d['revision']}，维护者 {d['owner']}")
-                overview += ["", "## 版本记录", ""]
-                for e in self.db.execute("SELECT kind,summary,created FROM events WHERE version=? AND kind LIKE 'version_%' ORDER BY seq", (v["id"],)):
-                    overview.append(f"- {e['created']} · {e['kind']}：{e['summary']}")
-                write(f"versions/{v['id']}/overview.md", "\n".join(overview) + "\n")
-            index += ["", "[公共协作历史](public-history.md) · [操作说明](../README.md)", "", "## 修订记录", "", "- v1.0：建立按需阅读的团队入口；状态由中枢登记生成。"]
-            write("index.md", "\n".join(index) + "\n")
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    check_cancel()
+                    time.sleep(.05)
+            with batch(self) as dirty_pages:
+                if dirty_pages is None:
+                    return
+                self._render_dirty(dirty_pages, check_cancel, PAGE_SIZE)
+
+    def _render_dirty(self, dirty_pages, check_cancel, PAGE_SIZE):
+        docs = self.root / "docs"
+        if docs.is_symlink():
+            raise ValueError('生成目录不得为符号链接')
+        docs.mkdir(exist_ok=True)
+        def write(relative, body):
+            check_cancel()
+            path = docs / relative
+            if not path.resolve().is_relative_to(docs.resolve()):
+                raise ValueError('生成文件不得越过docs目录')
+            if any(part.is_symlink() for part in (path, *path.parents) if part != docs.parent):
+                raise ValueError('生成路径不得包含符号链接')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists() and path.read_text() == body: return
+            temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+            temporary.write_text(body, encoding="utf-8")
+            os.replace(temporary, path)
+        current = self.current()
+        index = ["# 团队协作入口", "", "文档版本：v1.0", "", "仅用于团队共享与协作，不替代项目记忆或线程私有执行记录。", "", f"当前版本：{current or '尚未启动'}", "", "## 当前版本与历史索引", ""]
+        for v in self.db.execute("SELECT * FROM versions ORDER BY created DESC"):
+            index.append(f"- [{v['title']}](versions/{v['id']}/overview.md)：{v['state']}；{v['goal']}")
+            overview = [f"# {v['title']}", "", f"项目版本：{v['id']}；文档版本：v1.0；状态：{v['state']}", "", "## 总目标", "", v["goal"], "", "## 交付分工", ""]
+            slug(v['id'])
+            check_cancel()
+            for row in self.db.execute("SELECT * FROM version_roles WHERE version=? ORDER BY role", (v["id"],)):
+                overview.append(f"- [{row['role']}](../../roles/{row['role']}.md)：{row['state']}。{row['summary']}")
+            overview += ["", "## 共享资料索引", ""]
+            for d in self.db.execute("SELECT key,title,revision,owner FROM documents WHERE version=?", (v["id"],)):
+                overview.append(f"- [{d['title']}](../../documents/{d['key']}.md)：v1.{d['revision']}，维护者 {d['owner']}")
+            overview += ["", "## 版本记录", ""]
+            for e in self.db.execute("SELECT kind,summary,created FROM events WHERE version=? AND kind LIKE 'version_%' ORDER BY seq", (v["id"],)):
+                overview.append(f"- {e['created']} · {e['kind']}：{e['summary']}")
+            write(f"versions/{v['id']}/overview.md", "\n".join(overview) + "\n")
+        index += ["", "[公共协作历史](public-history.md) · [操作说明](../README.md)", "", "## 修订记录", "", "- v1.0：建立按需阅读的团队入口；状态由中枢登记生成。"]
+        write("index.md", "\n".join(index) + "\n")
+        pages = [r[0] for r in self.db.execute('SELECT DISTINCT (rowid-1)/? FROM requests ORDER BY 1 DESC', (PAGE_SIZE,))]
+        history_index = ['# 公共协作历史', '', '每页至多200条请求，完整历史保留在账本及以下分页中。', '']
+        history_index += [f'- [历史第 {page + 1} 页](history/page-{page + 1}.md)' for page in pages]
+        write('public-history.md', '\n'.join(history_index) + '\n')
+        for page in dirty_pages:
             history = ["# 公共协作历史", "", "文档结构版本：v1.0。这里只保存协作摘要、状态和资料引用；详细材料按需打开。", ""]
-            for r in self.db.execute("SELECT * FROM requests ORDER BY created DESC"):
+            for r in self.db.execute("SELECT * FROM requests WHERE rowid BETWEEN ? AND ? ORDER BY created DESC", (page * PAGE_SIZE + 1, (page + 1) * PAGE_SIZE)):
+                check_cancel()
                 history += [f"## {r['title']}", "", f"请求：{r['id']} · 修订：{r['revision']} · 项目版本：{r['version']}",
                             f"{r['sender']} → {r['recipient']} · {r['kind']} · {PRIORITY_NAMES[r['priority']]} · {r['status']}", "", r["action"], "", "完成条件：" + r["acceptance"]]
                 for ref in json.loads(r["refs"]): history.append(f"- 资料：{ref['path']}（{ref['revision']}）")
@@ -668,25 +714,27 @@ class BaseHub:
                 for e in self.db.execute("SELECT * FROM events WHERE request_id=? ORDER BY seq", (r["id"],)):
                     history.append(f"- {e['created']} · {e['actor']} · {e['kind']}：{e['summary']}")
                 history.append("")
-            write("public-history.md", "\n".join(history) + "\n")
-            for member in self.db.execute("SELECT * FROM members"):
-                role = member["role"]
-                body = [f"# {member['label']}：交付与产品更新", "", "文档结构版本：v1.0。只保留团队需要的交付信息；执行过程留在本线程。", "", "## 当前协作事项", ""]
-                for r in self.db.execute("SELECT id,title,status FROM requests WHERE version=? AND recipient=? ORDER BY created", (current, role)):
-                    body.append(f"- {r['id']} · {r['title']} · {r['status']}")
-                updates = self.db.execute("SELECT * FROM product_updates WHERE role=? ORDER BY created DESC", (role,)).fetchall()
-                body += ["", f"## 产品更新记录（v1.{len(updates)}）", ""]
-                if not updates: body.append("本中枢接入后尚无产品变更记录；不据此推断此前没有变更。")
-                for u in updates:
-                    body += [f"- {u['created']} · 关联版本 {u['version']}：{u['summary']}", f"  验证：{u['validation']}"]
-                    for ref in json.loads(u["refs"]): body.append(f"  资料：{ref['path']}（{ref['revision']}）")
-                body += ["", "## 修订记录", "", "- v1.0：建立协作交付与产品更新入口；每次新增产品更新追加记录。"]
-                write(f"roles/{role}.md", "\n".join(body) + "\n")
-            for d in self.db.execute("SELECT * FROM documents"):
-                body = [f"# {d['title']}", "", f"文档版本：v1.{d['revision']} · 维护者：{d['owner']} · 项目版本：{d['version']}", "", d["body"], "", "## 修订记录", ""]
-                for r in self.db.execute("SELECT * FROM revisions WHERE document=? ORDER BY revision DESC", (d["key"],)):
-                    body.append(f"- v1.{r['revision']} · {r['created']} · {r['actor']}：{r['note']}" + (f"（关联 {r['request_id']}）" if r["request_id"] else ""))
-                write(f"documents/{d['key']}.md", "\n".join(body) + "\n")
+            write(f"history/page-{page + 1}.md", "\n".join(history) + "\n")
+        for member in self.db.execute("SELECT * FROM members"):
+            role = slug(member["role"])
+            body = [f"# {member['label']}：交付与产品更新", "", "文档结构版本：v1.0。只保留团队需要的交付信息；执行过程留在本线程。", "", "## 当前协作事项", ""]
+            for r in self.db.execute("SELECT id,title,status FROM requests WHERE version=? AND recipient=? ORDER BY created", (current, role)):
+                body.append(f"- {r['id']} · {r['title']} · {r['status']}")
+            updates = self.db.execute("SELECT * FROM product_updates WHERE role=? ORDER BY created DESC", (role,)).fetchall()
+            body += ["", f"## 产品更新记录（v1.{len(updates)}）", ""]
+            if not updates: body.append("本中枢接入后尚无产品变更记录；不据此推断此前没有变更。")
+            for u in updates:
+                body += [f"- {u['created']} · 关联版本 {u['version']}：{u['summary']}", f"  验证：{u['validation']}"]
+                for ref in json.loads(u["refs"]): body.append(f"  资料：{ref['path']}（{ref['revision']}）")
+            body += ["", "## 修订记录", "", "- v1.0：建立协作交付与产品更新入口；每次新增产品更新追加记录。"]
+            write(f"roles/{role}.md", "\n".join(body) + "\n")
+        for d in self.db.execute("SELECT * FROM documents"):
+            slug(d['key'])
+            check_cancel()
+            body = [f"# {d['title']}", "", f"文档版本：v1.{d['revision']} · 维护者：{d['owner']} · 项目版本：{d['version']}", "", d["body"], "", "## 修订记录", ""]
+            for r in self.db.execute("SELECT * FROM revisions WHERE document=? ORDER BY revision DESC", (d["key"],)):
+                body.append(f"- v1.{r['revision']} · {r['created']} · {r['actor']}：{r['note']}" + (f"（关联 {r['request_id']}）" if r["request_id"] else ""))
+            write(f"documents/{d['key']}.md", "\n".join(body) + "\n")
 
     def call(self, thread_id, operation, args):
         role = self.actor(thread_id)
@@ -698,17 +746,28 @@ class BaseHub:
         if operation == "delivery_candidates":
             with self.transaction():
                 self.reconcile_wakeups()
-            # One candidate per recipient: a busy role's backlog must not hide
-            # another role that needs the native bridge to load its thread.
-            candidates, seen = [], set()
-            for row in self.db.execute("SELECT o.id delivery_id,o.recipient,m.thread_id FROM outbox o JOIN members m ON m.role=o.recipient WHERE o.state='pending' AND COALESCE(o.route,'')!='desktop-owner-retry' AND o.kind NOT IN ('budget_warning','budget_limit') ORDER BY o.priority,o.created,o.id"):
-                if row["recipient"] in seen or row["thread_id"] == thread_id:
-                    continue
-                seen.add(row["recipient"])
-                candidates.append(dict(row))
-                if len(candidates) == 8:
-                    break
-            return {"calling_thread_id": thread_id, "deliveries": candidates}
+                candidates, seen = [], set()
+                for row in self.db.execute("""SELECT o.id delivery_id,o.recipient,m.thread_id FROM outbox o
+                    JOIN members m ON m.role=o.recipient
+                    WHERE o.state='pending' AND o.available_at<=? AND COALESCE(o.route,'')!='desktop-owner-retry'
+                    AND o.kind NOT IN ('budget_warning','budget_limit')
+                    AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.role=o.recipient AND r.ended IS NULL)
+                    AND NOT EXISTS (SELECT 1 FROM outbox x WHERE x.recipient=o.recipient
+                        AND x.state IN ('sending','delivered','uncertain') AND x.kind NOT IN ('budget_warning','budget_limit'))
+                    ORDER BY o.priority,o.created,o.id""", (time.time(),)):
+                    if row['recipient'] in seen or row['thread_id'] == thread_id:
+                        continue
+                    seen.add(row['recipient']); candidates.append(dict(row))
+                # Rotate beyond native-only busy recipients without repeated polling.
+                cursor = self.meta('native_candidate_cursor')
+                ids = [r['delivery_id'] for r in candidates]
+                if cursor in ids:
+                    start = ids.index(cursor) + 1
+                    candidates = candidates[start:] + candidates[:start]
+                candidates = candidates[:8]
+                if candidates:
+                    self.set_meta('native_candidate_cursor', candidates[-1]['delivery_id'])
+            return {'calling_thread_id': thread_id, 'deliveries': candidates}
         if operation == "delivery_claim_native":
             with self.transaction():
                 self.reconcile_wakeups()
@@ -716,6 +775,8 @@ class BaseHub:
                 if row and row["state"] in {"archived", "cancelled"}:
                     return {"delivery_id": row["id"], "state": row["state"], "skipped": True}
                 if not row or row["state"] != "pending": raise ValueError("只领取待发送的中枢记录，禁止重复发送")
+                if row['version']:
+                    self.version(row['version'])
                 if self.active_run(row["recipient"]): raise ValueError("接收方已有工作登记，先核对当前执行")
                 if row['kind'] in ACTIVE_NOTICES:
                     raise ValueError('预算即时提醒由原对话工具输出通道投递')
@@ -727,17 +788,27 @@ class BaseHub:
                 self.budgets.prepare_delivery(row)
                 self.set_meta("native_claim:" + row["id"], role)
                 self.event(role, "native_delivery_claimed", "由中枢领取，使用 Codex 应用原生入口投递，禁止独立执行引擎", row["request_id"], row["version"])
-                return {"delivery_id": row["id"], "thread_id": self.member(row["recipient"])["thread_id"], "message": self.message(row)}
+                message = self.message(row)
+                self.set_meta('native_message:' + row['id'], message)
+                return {"delivery_id": row["id"], "thread_id": self.member(row["recipient"])["thread_id"], "message": message}
         if operation == "delivery_receipt_native":
             with self.transaction():
                 row = self.db.execute("SELECT * FROM outbox WHERE id=?", (args["delivery_id"],)).fetchone()
-                if not row or row["route"] != "desktop-native" or row["state"] not in {"sending", "delivered"}: raise ValueError("无匹配的原生投递领取记录")
+                if not row or row["route"] != "desktop-native" or row["state"] not in {"sending", "delivered", "uncertain", "completed"}: raise ValueError("无匹配的原生投递领取记录")
                 if role != MANAGER and self.meta("native_claim:" + row["id"]) != role: raise PermissionError("只有领取者或总管理可登记原生投递回执")
                 confirmed = args.get("confirmed") is True
-                self.db.execute("UPDATE outbox SET state=?,turn_id=?,last_error=?,updated=? WHERE id=?", ("delivered" if confirmed else "uncertain", args.get("turn_id"), None if confirmed else "原生投递结果未确认，禁止盲目重发", now(), row["id"]))
+                actual = args.get('turn_id')
+                if actual is not None and (not isinstance(actual, str) or not actual):
+                    raise ValueError('turn_id须为非空文本')
+                if actual and row['turn_id'] and actual != row['turn_id']:
+                    raise ValueError('迟到回执轮次冲突，须核对原投递')
+                state = row['state'] if row['state'] in {'delivered','completed'} else 'delivered' if confirmed else 'uncertain'
+                actual = row['turn_id'] or actual
+                error = row['last_error'] if state == 'completed' else (None if actual else '原生已确认接收，轮次关联待核对') if state == 'delivered' else '原生投递结果未确认，禁止盲目重发'
+                self.db.execute("UPDATE outbox SET state=?,turn_id=?,last_error=?,updated=? WHERE id=?", (state, actual, error, now(), row['id']))
                 if confirmed:
-                    self.budgets.receipt_turn(row, args.get('turn_id'))
-                return {"delivery_id": row["id"], "state": "delivered" if confirmed else "uncertain"}
+                    self.budgets.receipt_turn(row, actual)
+                return {'delivery_id': row['id'], 'state': state, 'turn_id': actual}
         if operation == "identity": return self.identity(role)
         if operation == "identity_protocol_update": return self.upgrade_identity_protocol(role)
         if operation == "begin": return self.begin(role, args)
@@ -762,6 +833,8 @@ class BaseHub:
             with self.transaction():
                 row = self.db.execute("SELECT * FROM outbox WHERE id=?", (args["delivery_id"],)).fetchone()
                 if not row or row["state"] not in {"failed", "uncertain"}: raise ValueError("仅重试失败或结果待确认的投递")
+                if row['version']:
+                    self.version(row['version'])
                 self.db.execute("UPDATE outbox SET state='pending',available_at=0,updated=? WHERE id=?", (now(), row["id"]))
                 if args.get('prefer_owner') is True:
                     evidence = short(args.get('verified_not_received'), '未送达及原对话owner核对证据', 800)

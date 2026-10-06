@@ -19,6 +19,8 @@ class DispatchExtensions:
     def team_cycle_snapshots(self):
         """Actual registered wait edges only; unrelated branches are not cycle identity."""
         version = self.current()
+        if not version or self.version(version, writable=False)['state'] in {'accepted','archived'}:
+            return []
         edges = {}
         for barrier in self.db.execute("SELECT * FROM barriers WHERE fired=0 AND version=?", (version,)):
             for identifier in json.loads(barrier["dependencies"]):
@@ -30,27 +32,44 @@ class DispatchExtensions:
         for req in edges.values():
             graph.setdefault(req["sender"], set()).add(req["recipient"])
 
-        def reaches(start, target, seen):
-            if start == target:
-                return True
-            if start in seen:
-                return False
-            return any(reaches(other, target, seen | {start}) for other in graph.get(start, ()))
-
-        cyclic = [req for req in edges.values() if reaches(req["recipient"], req["sender"], set())]
+        # Iterative Kosaraju: shared DAG tails are visited once, with no
+        # recursion limit or path-copy explosion. Only real wait edges enter.
+        reverse = {}
+        nodes = set(graph)
+        for sender, recipients in graph.items():
+            nodes.update(recipients)
+            for recipient in recipients:
+                reverse.setdefault(recipient, set()).add(sender)
+        seen, order = set(), []
+        for node in nodes:
+            if node in seen:
+                continue
+            seen.add(node)
+            stack = [(node, iter(graph.get(node, ())))]
+            while stack:
+                top, children = stack[-1]
+                child = next(children, None)
+                if child is None:
+                    order.append(top); stack.pop()
+                elif child not in seen:
+                    seen.add(child); stack.append((child, iter(graph.get(child, ()))))
+        components = {}
+        for node in reversed(order):
+            if node in components:
+                continue
+            components[node] = node
+            stack = [node]
+            while stack:
+                for other in reverse.get(stack.pop(), ()):
+                    if other not in components:
+                        components[other] = node; stack.append(other)
+        grouped = {}
+        for req in edges.values():
+            if components[req['sender']] == components[req['recipient']]:
+                grouped.setdefault(components[req['sender']], []).append(req)
         groups = []
-        while cyclic:
-            group = [cyclic.pop()]
-            roles = {group[0]["sender"], group[0]["recipient"]}
-            changed = True
-            while changed:
-                changed = False
-                for req in cyclic[:]:
-                    if roles & {req["sender"], req["recipient"]}:
-                        group.append(req)
-                        roles.update((req["sender"], req["recipient"]))
-                        cyclic.remove(req)
-                        changed = True
+        for group in grouped.values():
+            roles = {r[key] for r in group for key in ('sender', 'recipient')}
             group.sort(key=lambda req: req["id"])
             semantic = [{key: req[key] for key in ("id", "sender", "recipient", "status", "blocking")}
                         | {"action_sha256": hashlib.sha256(req["action"].encode()).hexdigest()} for req in group]
@@ -62,7 +81,10 @@ class DispatchExtensions:
 
     def enqueue_team_cycles(self, snapshots):
         for group in snapshots:
-            if self.db.execute("SELECT 1 FROM outbox WHERE event_key=?", (group["key"],)).fetchone():
+            old = self.db.execute("SELECT * FROM outbox WHERE event_key=?", (group["key"],)).fetchone()
+            if old:
+                if old['state'] == 'archived' and old['attempts'] == 0:
+                    self.db.execute("UPDATE outbox SET state='pending',updated=? WHERE id=?", (now(), old['id']))
                 continue
             payload = {"summary": "已登记的wait依赖成环，请读取以下请求并裁定依赖拆分。",
                        "roles": group["roles"], "requests": group["requests"], "cycle_schema": "team-cycle-v1"}
@@ -148,6 +170,38 @@ class DispatchExtensions:
         raise ValueError("有界历史未找到已发送轮次；禁止猜测完成")
 
     def call(self, thread_id, operation, args):
+        if operation in {'delivery_link_native_prepare','delivery_link_native_commit'}:
+            role = self.actor(thread_id)
+            self.require_manager(role)
+            with self.transaction():
+                row = self.db.execute('SELECT * FROM outbox WHERE id=?', (args.get('delivery_id'),)).fetchone()
+                if not row or row['route'] != 'desktop-native' or row['state'] not in {'sending','uncertain','delivered'} or row['turn_id']:
+                    raise ValueError('仅核对缺轮次的原生投递')
+                target = self.member(row['recipient'])['thread_id']
+                if args.get('expected_thread_id') != target:
+                    raise ValueError('原生目标不匹配')
+                key = 'native_link:' + row['id']
+                if operation.endswith('_prepare'):
+                    message = self.meta('native_message:' + row['id']) or self.message(row)
+                    ticket = {'token':secrets.token_hex(24),'expires':time.time()+60,'actor':thread_id,
+                              'signature':self.native_ledger_signature(row),
+                              'message_hash':hashlib.sha256(message.encode()).hexdigest()}
+                    self.set_meta(key, ticket)
+                    return {'thread_id':target,'message':message,'token':ticket['token']}
+                ticket = self.meta(key, {})
+                proof = args.get('proof', {})
+                if (ticket.get('token') != args.get('token') or ticket.get('expires',0) < time.time()
+                        or ticket.get('actor') != thread_id or ticket.get('signature') != self.native_ledger_signature(row)
+                        or not isinstance(proof, dict) or proof.get('thread_id') != target
+                        or not isinstance(proof.get('turn_id'), str) or not proof['turn_id']
+                        or not isinstance(proof.get('user_message'), str)
+                        or hashlib.sha256(proof['user_message'].encode()).hexdigest() != ticket.get('message_hash')):
+                    raise ValueError('缺少新鲜同线程、原消息精确匹配证据')
+                self.db.execute("UPDATE outbox SET state='delivered',turn_id=?,last_error=NULL,updated=? WHERE id=?", (proof['turn_id'], now(), row['id']))
+                self.budgets.receipt_turn(row, proof['turn_id'])
+                self.event(role, 'native_turn_linked', dump({'delivery_id':row['id'],'thread_id':target,'turn_id':proof['turn_id'], 'message_sha256':ticket['message_hash']}), row['request_id'], row['version'])
+                self.db.execute('DELETE FROM meta WHERE key=?', (key,))
+                return {'delivery_id':row['id'],'thread_id':target,'turn_id':proof['turn_id'],'state':'delivered'}
         if operation not in {"delivery_reconcile_native_prepare", "delivery_reconcile_native_commit"}:
             return super().call(thread_id, operation, args)
         role = self.actor(thread_id)

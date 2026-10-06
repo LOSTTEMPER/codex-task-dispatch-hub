@@ -20,22 +20,32 @@ class Worker:
         self.hub=hub
         self.active={}
         self.stopping=False
-        self.collector=UsageCollector(hub)
-        self.monitor=None
         self.monitor_stop=threading.Event()
+        self.collector=UsageCollector(hub, cancel=self.monitor_stop)
+        self.monitor=None
+        self.monitor_error=None
 
     def start_monitor(self):
         """Separate SQLite connection: desktop discovery cannot stall metering."""
         def monitor():
-            h=Hub(self.hub.root)
-            collector=UsageCollector(h)
+            h = None
             try:
+                h = Hub(self.hub.root)
+                collector = UsageCollector(h, cancel=self.monitor_stop)
                 while not self.monitor_stop.is_set():
-                    try:collector.collect()
-                    except Exception as e:
-                        with h.transaction():h.set_meta('budget_collector',{'state':'incomplete','checked_at':stamp(),'error':str(e)[:200]})
+                    collector.collect()
                     self.monitor_stop.wait(3)
-            finally:h.close()
+            except Exception as e:
+                self.monitor_error = str(e)[:200]
+                if h is not None:
+                    try:
+                        with h.transaction():
+                            h.set_meta('budget_collector', {'state':'incomplete','checked_at':stamp(),'error':self.monitor_error})
+                    except Exception:
+                        pass  # Main connection persists failure and falls back next tick.
+            finally:
+                if h is not None:
+                    h.close()
         self.monitor=threading.Thread(target=monitor,name='budget-metadata-monitor',daemon=True)
         self.monitor.start()
 
@@ -46,14 +56,16 @@ class Worker:
 
     def recover(self):
         with self.hub.transaction():
-            self.hub.db.execute("UPDATE outbox SET state='uncertain',last_error='发送确认丢失，核对原对话后再重试',updated=? WHERE state='sending'",(now(),))
+            self.hub.db.execute("UPDATE outbox SET state='uncertain',last_error='发送确认丢失，核对原对话后再重试',updated=? WHERE state='sending' AND (route='desktop-owner' OR route IS NULL)",(now(),))
         self.active={r['recipient']:r['id'] for r in self.hub.db.execute("SELECT * FROM outbox WHERE state='delivered' AND kind NOT IN ('budget_warning','budget_limit')")}
 
     def busy(self, role):
         return role in self.active or self.hub.active_run(role) is not None
 
     def live(self, role):
-        ipc=DesktopIPC()
+        if self.monitor_stop.is_set():
+            raise InterruptedError('worker stopping')
+        ipc=DesktopIPC(cancel=self.monitor_stop)
         try:
             tid=self.hub.member(role)['thread_id'];owner=ipc.owner(tid)
             return ipc,owner,ipc.runtime(tid,owner) if owner else None
@@ -66,13 +78,15 @@ class Worker:
             self.active[row['recipient']]=row['id']
         for role,identifier in list(self.active.items()):
             row=self.hub.db.execute('SELECT * FROM outbox WHERE id=?',(identifier,)).fetchone()
-            if row['state']!='delivered':self.active.pop(role,None);continue
+            if not row or row['state']!='delivered':self.active.pop(role,None);continue
+            if self.monitor_stop.is_set():return
+            if self.hub.active_run(role) or row['route']=='desktop-native':continue
             try:
                 ipc,owner,live=self.live(role)
                 try:
                     if not owner or live['status']!='idle':continue
                     if self.hub.active_run(role):continue
-                    self.update_delivery(identifier,state='completed',last_error=None)
+                    self.update_delivery(identifier,state='completed')
                     self.active.pop(role,None)
                 finally:ipc.close()
             except Exception as error:
@@ -83,6 +97,9 @@ class Worker:
             self.hub.reconcile_wakeups()
             row=self.hub.db.execute('SELECT * FROM outbox WHERE id=?',(row['id'],)).fetchone()
             if not row or row['state']!='pending':return False
+        if self.monitor_stop.is_set():return False
+        if row['version']:
+            self.hub.version(row['version'])
         role=row['recipient']
         immediate=row['kind'] in ACTIVE_NOTICES
         if not immediate and self.busy(role):return False
@@ -108,6 +125,7 @@ class Worker:
                 self.hub.db.execute("UPDATE outbox SET state='sending',attempts=attempts+1,route='desktop-owner',updated=? WHERE id=?",(now(),row['id']))
                 self.hub.budgets.prepare_delivery(row,active_turn=live['status']=='active')
             tid=self.hub.member(role)['thread_id']
+            if self.monitor_stop.is_set():raise InterruptedError('worker stopping before send')
             if immediate:
                 result=ipc.budget_notice(tid,owner,self.hub.budgets.notice(row),row['id'])
             else:
@@ -115,10 +133,10 @@ class Worker:
                 result=ipc.start(tid,owner,self.hub.message(row),row['id'])
             actual=turn_id(result)
             with self.hub.transaction():
-                self.hub.db.execute("UPDATE outbox SET state='delivered',turn_id=?,last_error=NULL,updated=? WHERE id=?",(actual,now(),row['id']))
+                self.hub.db.execute("UPDATE outbox SET state=CASE WHEN state='completed' THEN state ELSE 'delivered' END,turn_id=COALESCE(turn_id,?),last_error=CASE WHEN state='completed' THEN last_error ELSE NULL END,updated=? WHERE id=? AND state IN ('sending','uncertain','delivered','completed')",(actual,now(),row['id']))
                 self.hub.budgets.receipt_turn(row,actual)
                 if immediate:
-                    self.hub.db.execute('INSERT OR REPLACE INTO budget_notice_receipts VALUES(?,?,?,?,?,?)',
+                    self.hub.db.execute("INSERT INTO budget_notice_receipts VALUES(?,?,?,?,?,?) ON CONFLICT(delivery_id) DO UPDATE SET turn_id=COALESCE(budget_notice_receipts.turn_id,excluded.turn_id),updated=excluded.updated",
                         (row['id'],self.hub.budgets.notice(row)['budget']['id'],tid,actual,'accepted_by_app',stamp()))
             return True
         except Exception as error:
@@ -130,36 +148,52 @@ class Worker:
             if ipc:ipc.close()
 
     def tick(self):
-        if self.monitor is None:self.collector.collect()
+        if self.monitor_stop.is_set():return
+        if self.monitor is None or not self.monitor.is_alive():
+            self.collector.collect()
+            if self.monitor_error:
+                with self.hub.transaction():
+                    self.hub.set_meta('budget_monitor', {'state':'fallback','error':self.monitor_error,'checked_at':stamp()})
         self.refresh_active()
+        if self.monitor_stop.is_set():return
         with self.hub.transaction():self.hub.reconcile_wakeups()
         checked=set()
         for row in self.hub.db.execute("SELECT * FROM outbox WHERE state='pending' AND available_at<=? ORDER BY priority,created",(time.time(),)).fetchall():
+            if self.monitor_stop.is_set():return
             key=(row['recipient'],row['kind'] in ACTIVE_NOTICES)
             if key in checked:continue
             checked.add(key);self.dispatch(row)
+        if self.monitor_stop.is_set():return
         with self.hub.transaction():
             self.hub.evaluate()
             self.hub.set_meta('worker',{'pid':os.getpid(),'state':'running','mode':'desktop-visible-only',
                 'heartbeat':now(),'active_recipients':sorted(self.active)})
-        self.hub.render()
+        self.hub.render(cancel=self.monitor_stop)
 
 def main():
     hub=Hub();lock=open(hub.state/'worker.lock','a')
     try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError:raise SystemExit('中枢已有后台进程')
     worker=Worker(hub)
-    def stop(*_):worker.stopping=True
+    def stop(*_):
+        worker.stopping=True
+        worker.monitor_stop.set()
     signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
-    worker.recover()
-    worker.start_monitor()
+    from lifecycle import ControlEndpoint
+    endpoint = ControlEndpoint(hub.state / 'worker-control.sock', stop)
+    endpoint.start()
+    with hub.transaction():
+        hub.set_meta('worker', {'pid':os.getpid(),'state':'starting','mode':'desktop-visible-only','heartbeat':now()})
     try:
+        worker.recover()
+        worker.start_monitor()
         while not worker.stopping:
             try:worker.tick()
             except Exception as e:print(dump({'at':now(),'error':str(e)[:500]}),flush=True)
-            time.sleep(3)
+            worker.monitor_stop.wait(3)
     finally:
         worker.monitor_stop.set()
+        endpoint.close()
         if worker.monitor:worker.monitor.join(timeout=5)
         with hub.transaction():hub.set_meta('worker',{'state':'stopped','mode':'desktop-visible-only','heartbeat':now()})
         hub.close();lock.close()

@@ -144,11 +144,11 @@ class BudgetTests(unittest.TestCase):
             def budget_notice(self,*a):sent.append(a);return {'turn':{'id':'turn-a'}}
             def close(self):pass
         w=Worker(self.h)
-        with patch('worker.DesktopIPC',IPC):self.assertTrue(w.dispatch(row))
+        with patch('worker.DesktopIPC',lambda **kwargs:IPC()):self.assertTrue(w.dispatch(row))
         self.assertEqual(len(sent),1);self.assertNotIn('a',w.active)
         self.h.budgets.call('a','budget_ack',dict(budget_id=self.b,delivery_id=row['id']))
         self.assertEqual(self.h.db.execute('SELECT state FROM budget_notice_receipts').fetchone()[0],'processed')
-        with patch('worker.DesktopIPC',IPC):self.assertFalse(w.dispatch(row))
+        with patch('worker.DesktopIPC',lambda **kwargs:IPC()):self.assertFalse(w.dispatch(row))
 
     def test_stop_retains_late_descendant_usage(self):
         self.bind();self.tokens('t-a',10);self.c.collect();r=self.report();self.decide(r,'stop')

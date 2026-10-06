@@ -186,7 +186,17 @@ When every required participant is `submitted` and every required request is
 closed, readiness is merged into an existing dependency result where possible.
 Obsolete pending notices are archived without resending. Only the manager can
 accept or archive the version. Cycle notices use actual registered wait edges,
-not unrelated requests; unchanged cycles are reported once.
+not unrelated requests; unchanged cycles are reported once. If a never-sent
+cycle warning was archived and the same cycle recurs, that warning becomes
+pending again. Sent warning history remains deduplicated.
+
+History is paginated at 200 requests per stable page in `docs/history/`.
+`docs/public-history.md` links every page. Persistent dirty markers and indexes
+are installed automatically for existing ledgers; unchanged renders do no body
+reconstruction, and only affected history pages are rebuilt. SQLite retains all
+requests and events. Generated paths reject invalid identifiers and symlinks.
+Bootstrap validates the full configuration and commits members plus onboarding
+in one transaction.
 
 ## Operations
 
@@ -196,8 +206,16 @@ python3 control.py stop
 python3 control.py start
 ```
 
-The worker lock prevents duplicate workers. A delivery left in `sending` during
-a crash becomes `uncertain`; it is never blindly retried. The manager can retry
+The worker lock prevents duplicate workers. `stop` talks to the local worker
+control socket, never to a persisted PID. A stale or missing endpoint fails closed;
+for an older worker, verify its exact executable, script and process start before
+stopping it manually. The worker registers before its first tick, uses interruptible
+waits, and falls back to synchronous collection if the monitor exits. Monitor
+failure is recorded under `budget_monitor`. Desktop frames are limited to 32 MiB;
+oversized or timed-out frames keep the outcome unresolved. No automatic resend.
+
+A `desktop-owner` delivery left in `sending` during
+a worker crash becomes `uncertain`; concurrent `desktop-native` claims are retained; it is never blindly retried. The manager can retry
 only after checking the target conversation and ledger.
 
 The bridge and worker do not approve tools, change permissions, choose models,
@@ -215,7 +233,18 @@ against stale evidence. Only the outbox completion changes; business request
 status, message, attempts and original errors are preserved. The bridge then
 drains only that recipient's next registered delivery.
 
-Uncertain, missing-turn, desktop-owner and other-version records are rejected.
+The completion operation rejects uncertain, missing-turn, desktop-owner and
+other-version records. The worker never bypasses these native completion proofs.
+
+For a `desktop-native` record missing its turn ID, the manager can first use
+`delivery_link_native` with `delivery_id` and `expected_thread_id`. This reads at
+most 15 native turns and requires an exact match of the original registered user
+message. It only links the turn and confirms receipt; it never resends or declares
+completion. Unavailable/truncated history leaves the record unresolved. The
+normal send path also uses an authoritative send-result ID or exact user-message
+match, including already-completed turns. A newer turn alone is insufficient.
+The bridge waits for asynchronous ledger commands to finish and reports ambiguous
+claims as uncertain, so they are not silently retried.
 Private incident-specific recovery exceptions are deliberately not distributed.
 Do not call the internal prepare/commit operations or supply invented evidence.
 These checks are a same-user workflow convention, not a security boundary.
@@ -234,7 +263,13 @@ Use `budget_estimate` before work, `budget_view`/`budget_list` to inspect covera
 `end {state:"waiting",budget_review_id:...}` for review. The manager uses
 `budget_review_get` and `budget_decide` (increase/replan/phase/stop/clarify).
 Only an explicit positive increase adds allowance; counters never reset.
-`budget_close` requires completed work and descendants. Budget review is separate
+`budget_close` requires completed work, runs and descendants and invalidates open
+reviews. Closed/stopped budgets cannot be revived by old reviews or attached to
+new work; new bindings must match the run version. Existing turn bindings still
+accept late usage. Material report changes advance the review revision without
+creating duplicate notifications. First scans preserve explicitly assigned usage;
+missing source identities can recover, while genuine replacement/truncation
+remains an accounting gap. Malformed records are isolated to their source. Budget review is separate
 from business dependency cycles. It does not cancel tools or impose native goal
 limits. Missing sources are marked incomplete, never interpreted as zero usage.
 
@@ -275,13 +310,21 @@ records.
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 node tests/native_call_test.cjs
-node --test tests/native-reconcile.test.mjs
+node --test tests/native-reconcile.test.mjs tests/native-audit.test.mjs
 ```
 
 The test suite covers identity isolation, idempotency, priority, grouped waits,
 notify behavior, dependency cancellation and cycles, document ownership,
 version review, product-update deduplication, restart uncertainty, and live
 desktop busy-state handling.
+
+Synthetic performance results and the F01–F23 repair matrix are in
+[`validation/audit-fixes-20261006.md`](validation/audit-fixes-20261006.md).
+To repeat the five-round before/after benchmark (CPU intensive baseline):
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 tests/benchmark_audit.py
+```
 
 ## Update provenance
 

@@ -1,5 +1,6 @@
 """Read-only Codex metadata collector; never stores prompts, messages or credentials."""
 from __future__ import annotations
+from collections import deque
 import hashlib
 import json
 from pathlib import Path
@@ -8,7 +9,8 @@ from budget import stamp, encode
 
 
 class UsageCollector:
-    def __init__(self, hub, catalog=None):
+    def __init__(self, hub, catalog=None, cancel=None):
+        self.cancel = cancel
         self.h = hub
         self.db = hub.db
         self.catalog = Path(catalog or Path.home() / '.codex/state_5.sqlite')
@@ -16,14 +18,17 @@ class UsageCollector:
     def collect(self):
         if not self.db.execute('SELECT 1 FROM budgets LIMIT 1').fetchone():
             return
+        catalog = None
         try:
             catalog = sqlite3.connect(self.catalog.as_uri() + '?mode=ro', uri=True)
             catalog.row_factory = sqlite3.Row
             roots = [r[0] for r in self.db.execute('SELECT thread_id FROM members')]
             # Only inspect registered threads and their recursively enumerated children.
-            pending = [(r, None) for r in roots]; seen = set()
+            pending = deque((r, None) for r in roots); seen = set()
             while pending:
-                tid, parent = pending.pop(0)
+                if self.cancel is not None and self.cancel.is_set():
+                    return
+                tid, parent = pending.popleft()
                 if tid in seen:
                     continue
                 seen.add(tid)
@@ -31,7 +36,6 @@ class UsageCollector:
                 with self.h.transaction():
                     self.scan(tid, parent, meta)
                 pending.extend((r[0], tid) for r in catalog.execute('SELECT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id=?', (tid,)))
-            catalog.close()
             with self.h.transaction():
                 self.h.set_meta('budget_collector', {'state': 'running', 'checked_at': stamp(), 'threads': len(seen)})
                 self.h.budgets.evaluate()
@@ -39,6 +43,9 @@ class UsageCollector:
         except (OSError, sqlite3.Error, ValueError) as e:
             with self.h.transaction():
                 self.h.set_meta('budget_collector', {'state': 'incomplete', 'checked_at': stamp(), 'error': str(e)[:200]})
+        finally:
+            if catalog is not None:
+                catalog.close()
 
     def scan(self, tid, parent, meta):
         source = self.db.execute('SELECT * FROM budget_sources WHERE thread_id=?', (tid,)).fetchone()
@@ -47,6 +54,9 @@ class UsageCollector:
             self.db.execute('INSERT INTO budget_sources(thread_id,parent_thread_id,created) VALUES(?,?,?)', (tid, parent, stamp()))
             source = self.db.execute('SELECT * FROM budget_sources WHERE thread_id=?', (tid,)).fetchone()
         s = dict(source)
+        initialized = s['path'] is not None and s['inode'] is not None
+        if not initialized:
+            s.update(quality='pending', issue=None)
         self.inherit(s)
         try:
             if not meta or not meta['rollout_path']:
@@ -54,19 +64,23 @@ class UsageCollector:
             if meta['model_provider'] != 'openai':
                 raise ValueError('unverified provider counter')
             path = Path(meta['rollout_path']); st = path.stat(); inode = str(st.st_ino)
-            if not fresh and (s['path'] != str(path) or s['inode'] != inode or st.st_size < s['offset']):
+            if initialized and (s['path'] != str(path) or s['inode'] != inode or st.st_size < s['offset']):
                 # Do not guess/replay after replacement; expose the accounting gap.
                 raise ValueError('source replaced or truncated; reconciliation required')
             s.update(path=str(path), inode=inode)
             with path.open('rb') as stream:
                 stream.seek(s['offset'])
                 while True:
+                    if self.cancel is not None and self.cancel.is_set():
+                        break
                     offset = stream.tell(); line = stream.readline()
                     if not line or not line.endswith(b'\n'):
                         break  # Partial record is retried at exactly the same offset.
                     obj = json.loads(line)
+                    if not isinstance(obj, dict):
+                        raise ValueError('record must be an object at offset ' + str(offset))
                     if obj.get('type') == 'event_msg':
-                        self.event(s, obj, offset, prime=fresh and parent is None)
+                        self.event(s, obj, offset, prime=not initialized and parent is None)
                     s['offset'] = stream.tell()
             # A discovered descendant without a binding is retained for diagnosis;
             # historic descendants are not retroactively charged to a new task.
@@ -96,7 +110,15 @@ class UsageCollector:
                     self.h.budgets.bind_turn(s['thread_id'],turn,inherited,b['version'],started=s['turn_started'])
 
     def event(self, s, obj, offset, prime=False):
-        p = obj.get('payload', {}); kind = p.get('type'); tid = s['thread_id']; observed = obj.get('timestamp', stamp())
+        p = obj.get('payload', {})
+        if not isinstance(p, dict):
+            raise ValueError('event payload must be an object')
+        kind = p.get('type'); tid = s['thread_id']; observed = obj.get('timestamp', stamp())
+        if not isinstance(observed, str):
+            raise ValueError('invalid event timestamp')
+        for key in ('turn_id', 'root_turn_id'):
+            if p.get(key) is not None and not isinstance(p[key], str):
+                raise ValueError('invalid ' + key)
         if kind == 'task_started':
             s.update(turn_id=p.get('turn_id'), turn_started=observed, turn_ended=None,root_turn_id=p.get('root_turn_id'))
             self.inherit(s)
@@ -112,7 +134,7 @@ class UsageCollector:
                 parent = self.db.execute('SELECT inherited_budget FROM budget_sources WHERE thread_id=?', (s['parent_thread_id'],)).fetchone()
                 inherited = (parent[0] if parent else None) or (ancestor[0] if ancestor else None)
                 s['inherited_budget'] = inherited
-            if not prime and not binding and assignment and observed >= assignment['created']:
+            if not binding and assignment and observed >= assignment['created']:
                 self.h.budgets.bind_turn(tid, s['turn_id'], assignment['budget_id'], assignment['version'], assignment['kind'], observed)
                 self.db.execute('DELETE FROM budget_assignments WHERE thread_id=?', (tid,))
             elif not prime and not binding and inherited:
@@ -124,13 +146,17 @@ class UsageCollector:
             if not p.get('turn_id') or p['turn_id'] == s['turn_id']:
                 s['turn_ended'] = observed
                 self.db.execute('UPDATE budget_turns SET ended=? WHERE thread_id=? AND turn_id=?', (observed,tid,s['turn_id']))
-        elif kind == 'token_count' and p.get('info'):
-            info = p['info']; totals = info.get('total_token_usage', {}); total = totals.get('total_tokens')
+        elif kind == 'token_count' and p.get('info') is not None:
+            info = p['info']
+            if not isinstance(info, dict) or not isinstance(info.get('total_token_usage', {}), dict) or not isinstance(info.get('last_token_usage', {}), dict):
+                raise ValueError('invalid token usage shape')
+            totals = info.get('total_token_usage', {}); total = totals.get('total_tokens')
             last = info.get('last_token_usage', {}).get('total_tokens')
             if not isinstance(total, int) or total < 0:
                 s.update(quality='gap', issue='invalid cumulative counter'); return
             previous = s['total']; s['total'] = total
-            if prime:
+            binding = self.db.execute('SELECT * FROM budget_turns WHERE thread_id=? AND turn_id=?', (tid,s['turn_id'])).fetchone()
+            if prime and not binding:
                 return
             if previous is None:
                 # Fork history can seed a cumulative total; only its first new

@@ -18,42 +18,89 @@ class DesktopIPC:
     code-signing-restricted native app-tools pipe or modifies its authorizer.
     Unknown owner/protocol is an error; it is not permission to interrupt a task.
     """
-    def __init__(self, path=None):
+    def __init__(self, path=None, cancel=None):
+        self.cancel = cancel
         self.path = str(path or Path.home() / ".codex" / "ipc" / "ipc.sock")
         self.client = "initializing-client"
         self.socket = socket.socket(socket.AF_UNIX)
-        self.socket.settimeout(12)
-        self.socket.connect(self.path)
-        result = self.request("initialize", {"clientType": "task-dispatch-hub"}, 0, timeout=5)
-        self.client = result["result"]["clientId"]
+        self.socket.settimeout(.25)
+        try:
+            self.socket.connect(self.path)
+            result = self.request("initialize", {"clientType": "task-dispatch-hub"}, 0, timeout=5)
+            self.client = result["result"]["clientId"]
+        except BaseException:
+            self.socket.close()
+            raise
 
-    def _write(self, message):
+    MAX_FRAME = 32 * 1024 * 1024
+
+    def _check(self, deadline):
+        if getattr(self, 'cancel', None) is not None and self.cancel.is_set():
+            raise InterruptedError("desktop IPC cancelled; delivery outcome may be unknown")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("desktop IPC absolute deadline exceeded")
+
+    def _write(self, message, deadline):
+        self._check(deadline)
         data = json.dumps(message, ensure_ascii=False).encode()
-        self.socket.sendall(struct.pack("<I", len(data)) + data)
+        if len(data) > self.MAX_FRAME:
+            raise RPCError("desktop IPC frame exceeds limit")
+        self._check(deadline)
+        frame = memoryview(struct.pack("<I", len(data)) + data)
+        while frame:
+            self._check(deadline)
+            self.socket.settimeout(min(.25, max(.001, deadline - time.monotonic())))
+            try:
+                sent = self.socket.send(frame[:65536])
+            except socket.timeout:
+                continue
+            if sent <= 0:
+                raise ConnectionError('desktop IPC closed while writing')
+            frame = frame[sent:]
+        self._check(deadline)
 
-    def _read_exact(self, size):
-        data = b""
+    def _read_exact(self, size, deadline=None):
+        if size < 0 or size > self.MAX_FRAME:
+            raise RPCError("invalid desktop IPC frame")
+        data = bytearray()
         while len(data) < size:
-            chunk = self.socket.recv(size - len(data))
-            if not chunk: raise ConnectionError("desktop IPC closed")
-            data += chunk
+            self._check(deadline)
+            if deadline is not None:
+                self.socket.settimeout(min(.25, max(.001, deadline - time.monotonic())))
+            try:
+                chunk = self.socket.recv(min(size - len(data), 65536))
+            except socket.timeout:
+                if deadline is None:
+                    raise
+                continue
+            if not chunk:
+                raise ConnectionError("desktop IPC closed")
+            data.extend(chunk)
+        self._check(deadline)
         return data
+
+    def _frame(self, deadline):
+        size = struct.unpack("<I", self._read_exact(4, deadline))[0]
+        data = self._read_exact(size, deadline)
+        self._check(deadline)
+        response = json.loads(data)
+        self._check(deadline)
+        if not isinstance(response, dict):
+            raise RPCError("invalid desktop IPC object")
+        return response
 
     def request(self, method, params, version, target=None, timeout=12):
         identifier = str(uuid.uuid4())
         message = {"type": "request", "requestId": identifier, "sourceClientId": self.client,
                    "version": version, "method": method, "params": params, "timeoutMs": int(timeout * 1000)}
         if target: message["targetClientId"] = target
-        self._write(message)
         deadline = time.monotonic() + timeout
+        self._write(message, deadline)
         while time.monotonic() < deadline:
-            self.socket.settimeout(max(.1, deadline - time.monotonic()))
-            size = struct.unpack("<I", self._read_exact(4))[0]
-            if size > 256 * 1024 * 1024: raise RPCError("invalid desktop IPC frame")
-            response = json.loads(self._read_exact(size))
+            response = self._frame(deadline)
             if response.get("type") == "client-discovery-request":
                 self._write({"type": "client-discovery-response", "requestId": response["requestId"],
-                             "result": {"canHandle": False}})
+                             "result": {"canHandle": False}}, deadline)
             if response.get("requestId") == identifier and response.get("type") == "response":
                 return response
         raise TimeoutError("desktop IPC outcome unknown: " + method)
@@ -74,16 +121,13 @@ class DesktopIPC:
         return result.get("result", {})
 
     def runtime(self, thread_id, owner):
+        deadline = time.monotonic() + 12
         self._write({"type": "broadcast", "sourceClientId": self.client,
             "method": "thread-stream-following-changed", "version": 1,
             "params": {"conversationId": thread_id, "hostId": "local", "following": True},
-            "targetClientIds": [owner]})
-        deadline = time.monotonic() + 12
+            "targetClientIds": [owner]}, deadline)
         while time.monotonic() < deadline:
-            self.socket.settimeout(max(.1, deadline - time.monotonic()))
-            size = struct.unpack("<I", self._read_exact(4))[0]
-            if size > 256 * 1024 * 1024: raise RPCError("invalid desktop IPC frame")
-            message = json.loads(self._read_exact(size))
+            message = self._frame(deadline)
             params = message.get("params", {})
             change = params.get("change", {})
             if params.get("conversationId") == thread_id and change.get("type") == "snapshot":

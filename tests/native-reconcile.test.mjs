@@ -26,7 +26,7 @@ function fixture(mode, target = 'art') {
       else if (op === 'delivery_claim_native') result = { thread_id: target, message: 'registered exact message' };
       else if (op === 'delivery_receipt_native') result = { state: 'delivered' };
       else throw Error(`unexpected ${op}`);
-      return { output: JSON.stringify({ ok: true, result }) };
+      return { output: JSON.stringify({ ok: true, result }), exit_code: 0 };
     },
     async mcp__codex_app__wait_threads() {
       polls++;
@@ -41,7 +41,7 @@ function fixture(mode, target = 'art') {
     },
     async mcp__codex_app__send_message_to_thread(args) {
       sent.push(args);
-      return wrap({ threadId: args.threadId });
+      return wrap({ threadId: args.threadId, turnId: "sent-turn" });
     }
   };
   return { tools, calls, sent, commits };
