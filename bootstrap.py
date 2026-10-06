@@ -30,7 +30,7 @@ def load_config(path: Path):
 def identity_block(item, root):
     return "\n".join([
         "<team_identity>",
-        "card_version: 1.0",
+        "card_version: 1.2",
         "thread_id: " + item["thread_id"],
         "role: " + item["role"],
         "name: " + item["label"],
@@ -39,7 +39,7 @@ def identity_block(item, root):
         "product updates, create hub requests, and read shared collaboration documents.",
         "authority_boundary: This card does not grant installation, deployment, "
         "data migration, billing, or external model access.",
-        f"hub_entry: python3 '{root / 'hub.py'}' call <operation>",
+        f"hub_entry: execute {root / 'native_call.js'} in the current tools context; pass {root / 'hub.py'} as hubPath.",
         "identity_check: call identity when role or authority is unclear; the actual "
         "CODEX_THREAD_ID is authoritative.",
         "turn_protocol: call begin before formal work and end before the final response; "
@@ -69,7 +69,7 @@ def main():
             card = {
                 "role": item["role"],
                 "thread_id": item["thread_id"],
-                "card_version": "1.0",
+                "card_version": "1.2",
                 "identity_block": block,
             }
             hub.db.execute(

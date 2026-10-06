@@ -24,3 +24,10 @@ must not be copied into this shared file.
   compaction. Never adopt another conversation's quoted identity card.
 - Identity cards define collaboration ownership only. They do not grant new
   installation, deployment, data, billing, or model-access authority.
+
+## Native transport
+
+Use `native_call.js` in the current tools context with the absolute `hub.py` path.
+Only send exact messages claimed from the ledger. Do not launch a separate model
+or app-server for dispatch. Pure progress uses document/product updates; register
+a wait group once, then end. Unknown delivery outcomes are never blindly retried.

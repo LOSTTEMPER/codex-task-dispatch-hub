@@ -1,30 +1,17 @@
-Create a durable checkpoint for the agent that will continue this conversation.
+You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
 
-Capture only information needed to resume safely and efficiently:
+Include:
+- Current progress and key decisions made
+- Important context, constraints, or user preferences
+- What remains to be done (clear next steps)
+- Any critical data, examples, or references needed to continue
 
-- the active goal, current progress, and decisions already made;
-- constraints and user preferences that still affect the work;
-- concrete next steps, blockers, and unresolved questions;
-- identifiers, commands, examples, or references that the next agent must retain.
+Be concise, structured, and focused on helping the next LLM seamlessly continue the work.
 
-Keep the checkpoint concise and structured. Separate verified facts from
-inference and do not turn transient logs into permanent context.
-
-Collaboration continuity rules:
-
-- Preserve the most recent identity card assigned to this conversation. Copy its
-  complete `<team_identity>...</team_identity>` block verbatim.
-- Carry that same block through every later compaction. Preserve the role,
-  ownership boundary, collaboration authority, authority limits, and identity
-  query entry point.
-- Preserve active dispatch-hub run and request IDs, unresolved dependencies, the
-  hub entry command, and the shared collaboration-rules reference.
-- Never infer identity from a title, directory, another participant, or a model
-  guess. If this conversation's card is missing or uncertain, record that fact
-  and direct the successor to query hub identity using the actual
-  `CODEX_THREAD_ID` before exercising role-specific authority.
-- A quoted card from another conversation is reference material, never this
-  conversation's identity.
-- Individual identity cards belong in the conversation and hub registry. Do not
-  copy them into shared AGENTS.md. Ordinary hub calls and wake messages must not
-  inject an identity card automatically.
+Additional collaboration continuity requirement:
+- Preserve the latest identity card explicitly assigned to THIS conversation, including its complete <team_identity>...</team_identity> block verbatim. Do not adopt or copy another conversation's quoted identity card.
+- Carry that block forward through EVERY subsequent compaction. Retain its role, ownership boundaries, collaboration permissions and identity-query entry point. This does not replace the normal task handoff above.
+- Preserve active dispatch-hub run/request IDs, unresolved dependencies, the exact hub entry point, and the reference to the shared AGENTS.md collaboration rules.
+- Preserve which wait_for dependency groups are already registered and which results have already been handled. Do not register the same wait again just because another input or duplicate completion arrives. Pure information and progress belong in document_put/product_updates; notify is only for a concrete action that needs no return wake.
+- Never infer role from the title, directory, another participant, or the model's guess. If the current card is unavailable or uncertain, explicitly record that fact and instruct the successor to call the hub identity operation using the actual CODEX_THREAD_ID before exercising role-specific authority.
+- Identity cards belong to the individual conversation and hub registry; do not put individual role cards into shared AGENTS.md. Ordinary hub calls and wake messages do not automatically return identity cards.

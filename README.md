@@ -45,15 +45,16 @@ flowchart LR
 
 ## Requirements
 
-- Python 3.9 or later; no third-party Python packages are required.
-- Codex CLI or the macOS Codex desktop application's bundled `codex` binary.
+- Python 3.9 or later; no third-party Python packages.
+- Codex Desktop with native thread tools available in the current conversation.
 - Existing Codex conversations whose thread IDs you control.
-- A trusted local project when using project-level `.codex/config.toml`.
+- Node.js only for the mocked JavaScript tests.
 
-The worker looks for `codex` on `PATH`, then checks the standard macOS desktop
-bundle. Set `CODEX_DISPATCH_CODEX_BIN` to an explicit executable path when
-needed. Set `CODEX_DISPATCH_WORKSPACE` to choose the app-server working
-directory.
+The default entry is `native_call.js`, evaluated in the current conversation's
+`functions.exec` tool context. It does not launch a separate app-server or model.
+The optional worker only delivers to conversations already owned by Desktop.
+Unknown ownership or unavailable native tools leaves work queued, without a
+hidden fallback. Desktop tool and IPC compatibility depends on the installed app.
 
 ## Quick start
 
@@ -82,7 +83,7 @@ directory.
    Bootstrap refuses to run unless the current `CODEX_THREAD_ID` matches the
    configured manager. It also refuses to overwrite an initialized registry.
 
-4. Start the worker from an authorized local Codex terminal.
+4. Optionally start the desktop-owned queue worker from an authorized terminal.
 
    ```sh
    python3 control.py start
@@ -105,31 +106,41 @@ directory.
 
 ## Turn protocol
 
-Hub calls use JSON from standard input. Short payloads can use `--json`.
+In `functions.exec`, load the bridge and pass the absolute ledger entry path:
 
-```sh
-python3 hub.py call identity --json '{}'
-python3 hub.py call begin --json '{"request_ids":[]}'
+```javascript
+const root = "/absolute/path/to/codex-task-dispatch-hub";
+const quote = value => "'" + value.replace(/'/g, "'\\''") + "'";
+const source = await tools.exec_command({
+  cmd: "cat " + quote(root + "/native_call.js"), max_output_tokens: 10000
+});
+if (source.exit_code !== 0) throw new Error("Cannot read hub entry");
+const hub = new Function("tools", "operation", "payload", "hubPath", source.output);
+text(await hub(tools, "begin", {request_ids: []}, root + "/hub.py"));
 ```
 
-Save the `run_id` returned by `begin`. Finish before the conversation sends its
-final response:
+Use the same function for `identity`, `request`, `document_put`, and `end`.
+The fourth parameter selects this checkout; omitting it uses `./hub.py` relative
+to the tool's working directory. Save `result.run_id` from `begin`, then end with:
 
-```sh
-python3 hub.py call end <<'JSON'
-{
-  "run_id": "run-id-from-begin",
-  "state": "idle",
-  "summary": "Optional team-visible result",
-  "results": [],
-  "product_updates": []
-}
-JSON
+```javascript
+text(await hub(tools, "end", {
+  run_id: "actual-run-id", state: "idle", summary: "Result and limitations",
+  results: [], product_updates: []
+}, root + "/hub.py"));
 ```
+
+The bridge persists first, claims an existing outbox record, sends its exact
+registered message with native tools, and records the receipt. Read-only ledger
+operations do not drain. CLI `python3 hub.py call <operation> --json '{}'` is
+available for diagnostics; after an emergency CLI write use the native `drain`
+operation in the current tools context. Do not manually relay or duplicate tasks.
 
 End states are `idle`, `waiting`, `submitted`, `needs_user`, and `interrupted`.
-Use `waiting` only with `wait_for` request IDs. `end` closes a work turn; it does
-not implicitly complete received requests.
+`waiting` requires `wait_for` dependencies or an explicit `budget_review_id`.
+Register a dependency set once and end the turn; do not poll or send receipt
+requests. `end` completes a work turn, not its requests: submit each actual result
+in `results`. Pure progress belongs in `document_put` or `product_updates`.
 
 ## Requests
 
@@ -172,8 +183,10 @@ hand or committed with private operational data.
 
 The manager uses `version_create` to establish a goal and initial assignments.
 When every required participant is `submitted` and every required request is
-closed, the manager receives one review-ready event. Only the manager can accept
-or archive the version.
+closed, readiness is merged into an existing dependency result where possible.
+Obsolete pending notices are archived without resending. Only the manager can
+accept or archive the version. Cycle notices use actual registered wait edges,
+not unrelated requests; unchanged cycles are reported once.
 
 ## Operations
 
@@ -187,9 +200,50 @@ The worker lock prevents duplicate workers. A delivery left in `sending` during
 a crash becomes `uncertain`; it is never blindly retried. The manager can retry
 only after checking the target conversation and ledger.
 
-The app-server adapter declines command and file-change approval requests. It
-does not fabricate user answers or grant permissions. A recipient that needs
-authority should end with `needs_user` and ask the user in its own conversation.
+The bridge and worker do not approve tools, change permissions, choose models,
+or fabricate user answers. Native sends still require the user's authorization.
+
+### Completed native delivery reconciliation
+
+If a confirmed `desktop-native` delivery remains `delivered` after its turn has
+finished, the manager can call `delivery_reconcile_native` via the native bridge
+with `delivery_id`, `expected_thread_id`, and `expected_turn_id`. The bridge reads
+fresh native status, bounded history (at most 15 turns), then status again. All
+intervening turns must be completed, the target idle, and the ledger have no active
+run. A manager-bound 60-second ticket and transactional ledger signature protect
+against stale evidence. Only the outbox completion changes; business request
+status, message, attempts and original errors are preserved. The bridge then
+drains only that recipient's next registered delivery.
+
+Uncertain, missing-turn, desktop-owner and other-version records are rejected.
+Private incident-specific recovery exceptions are deliberately not distributed.
+Do not call the internal prepare/commit operations or supply invented evidence.
+These checks are a same-user workflow convention, not a security boundary.
+
+### Soft token budgets
+
+Budgets are optional and disabled until configured by the manager. They count
+actual input/cached-input/output usage for assigned turns and discovered child
+threads, not money or account limits. `budget_configure` enables the policy;
+`request` can attach `budget:{token_limit,warning_tokens}` or an existing
+`budget_id`. Existing unassigned work is not retroactively charged. Administrative
+exceptions require `unmanaged_reason` when enforcement is enabled.
+
+Use `budget_estimate` before work, `budget_view`/`budget_list` to inspect coverage,
+`budget_ack` for notices, and `budget_report` followed by
+`end {state:"waiting",budget_review_id:...}` for review. The manager uses
+`budget_review_get` and `budget_decide` (increase/replan/phase/stop/clarify).
+Only an explicit positive increase adds allowance; counters never reset.
+`budget_close` requires completed work and descendants. Budget review is separate
+from business dependency cycles. It does not cancel tools or impose native goal
+limits. Missing sources are marked incomplete, never interpreted as zero usage.
+
+The optional worker reads local Codex token metadata and rollout usage counters
+for registered threads and descendants. It stores accounting metadata, not
+conversation contents or credentials. The current collector expects the local
+`state_5.sqlite` schema and reports incomplete coverage on incompatible versions.
+No network/model API is used by the collector. Live budget notices use the
+experimental Desktop owner tool-output channel; an unknown outcome is not retried.
 
 ## Local data and privacy
 
@@ -220,12 +274,25 @@ records.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+node tests/native_call_test.cjs
+node --test tests/native-reconcile.test.mjs
 ```
 
 The test suite covers identity isolation, idempotency, priority, grouped waits,
 notify behavior, dependency cancellation and cycles, document ownership,
 version review, product-update deduplication, restart uncertainty, and live
 desktop busy-state handling.
+
+## Update provenance
+
+Version 0.2.0 synchronizes the locally deployed October 2026 shared ledger,
+native bridge, worker, budget collector, and dependency-cycle/native-completion
+repairs. Public bootstrap remains configuration-based. Each independent team
+uses its own checkout/root, private config, `.state/`, and generated `docs/`.
+No running deployment, database, team binding, or worker is migrated by this
+source update. Stop a worker and back up its private state before upgrading that
+deployment; never copy another team's state. Existing 1.0 identity cards can be
+upgraded by the manager using `identity_protocol_update`.
 
 ## License
 

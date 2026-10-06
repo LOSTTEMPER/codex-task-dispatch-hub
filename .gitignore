@@ -7,3 +7,5 @@ docs/
 .codex/
 config/team.json
 *.log
+artifacts/
+*.sqlite*

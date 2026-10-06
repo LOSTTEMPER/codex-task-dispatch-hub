@@ -1,129 +1,14 @@
-"""Codex transport adapters. No model/API credentials and no shell interpolation.
-
-App Server is the public transport for dormant conversations. For a conversation
-already owned by a desktop window, the local desktop follower protocol delegates
-to that owner instead of creating a competing runtime. Neither adapter changes
-approval policy, model provider, sandbox permissions or application binaries.
-"""
+"""Desktop-owned dispatch only. Never launches a Codex execution engine."""
 from __future__ import annotations
-
 import json
-import os
 from pathlib import Path
-import queue
-import shutil
 import socket
 import struct
-import subprocess
-import threading
 import time
 import uuid
 
-def resolve_codex_binary():
-    override = os.environ.get("CODEX_DISPATCH_CODEX_BIN")
-    if override:
-        return override
-    discovered = shutil.which("codex")
-    if discovered:
-        return discovered
-    desktop_binary = "/Applications/ChatGPT.app/Contents/Resources/codex"
-    if Path(desktop_binary).is_file():
-        return desktop_binary
-    raise FileNotFoundError(
-        "Codex executable not found. Set CODEX_DISPATCH_CODEX_BIN to its path."
-    )
-
-
 class RPCError(RuntimeError):
     pass
-
-
-class AppServer:
-    def __init__(self, cwd, stderr=None):
-        self.lock = threading.Lock()
-        self.pending = {}
-        self.notifications = queue.Queue()
-        self.next_id = 0
-        self.closed = False
-        self.process = subprocess.Popen([resolve_codex_binary(), "app-server", "--stdio"], cwd=str(cwd),
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=stderr or subprocess.DEVNULL, text=True, bufsize=1)
-        threading.Thread(target=self._reader, daemon=True).start()
-        self.call("initialize", {"clientInfo": {"name": "task_dispatch_hub", "version": "1.0.0"},
-                                 "capabilities": {"experimentalApi": True}}, timeout=20)
-        self.send({"method": "initialized"})
-
-    def send(self, value):
-        with self.lock:
-            self.process.stdin.write(json.dumps(value, ensure_ascii=False) + "\n")
-            self.process.stdin.flush()
-
-    def _reader(self):
-        try:
-            for line in self.process.stdout:
-                try: message = json.loads(line)
-                except ValueError: continue
-                if "id" in message and "method" not in message:
-                    waiter = self.pending.get(message["id"])
-                    if waiter: waiter.put(message)
-                else:
-                    self.notifications.put(message)
-                    if "id" in message and "method" in message:
-                        method = message["method"]
-                        # No blanket approvals or user-input fabrication by the dispatcher.
-                        if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
-                            self.send({"id": message["id"], "result": {"decision": "decline"}})
-                        else:
-                            self.send({"id": message["id"], "error": {"code": -32601,
-                                "message": "Task dispatch hub cannot answer user approvals or questions. Record needs_user and ask the user in the conversation."}})
-        finally:
-            self.closed = True
-            for waiter in list(self.pending.values()):
-                waiter.put({"error": {"message": "app-server connection closed"}})
-
-    def call(self, method, params, timeout=15):
-        if self.closed: raise RPCError("app-server connection closed")
-        self.next_id += 1
-        identifier = self.next_id
-        waiter = queue.Queue()
-        self.pending[identifier] = waiter
-        try:
-            self.send({"id": identifier, "method": method, "params": params})
-            try: reply = waiter.get(timeout=timeout)
-            except queue.Empty: raise TimeoutError(method + " response unknown")
-            if "error" in reply: raise RPCError(str(reply["error"].get("message", reply["error"])))
-            return reply.get("result", {})
-        finally:
-            self.pending.pop(identifier, None)
-
-    def latest_turn(self, thread_id):
-        result = self.call("thread/turns/list", {"threadId": thread_id, "limit": 1,
-                                               "sortDirection": "desc", "itemsView": "summary"})
-        data = result.get("data", [])
-        return data[0] if data else None
-
-    def queue_list(self, thread_id):
-        return self.call("thread/queue/list", {"threadId": thread_id, "limit": 10}).get("data", [])
-
-    def resume(self, thread_id, compact_path):
-        result = self.call("thread/resume", {"threadId": thread_id, "excludeTurns": True,
-            "config": {"experimental_compact_prompt_file": str(compact_path)}}, timeout=40)
-        if result.get("modelProvider") != "openai":
-            raise RPCError("当前任务未使用授权的 Codex OpenAI provider，中枢拒绝产生外部模型调用")
-        if result.get("thread", {}).get("id") != thread_id:
-            raise RPCError("恢复的任务身份与目标不一致")
-        return result
-
-    def start(self, thread_id, text, message_id):
-        return self.call("turn/start", {"threadId": thread_id,
-            "clientUserMessageId": message_id,
-            "input": [{"type": "text", "text": text, "text_elements": []}]}, timeout=30)
-
-    def close(self):
-        if self.process.poll() is None:
-            self.process.terminate()
-            try: self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired: self.process.kill()
 
 
 class DesktopIPC:
@@ -207,6 +92,16 @@ class DesktopIPC:
                 return {"status": state.get("threadRuntimeStatus", {}).get("type"),
                         "provider": state.get("modelProvider")}
         raise TimeoutError("desktop live state unavailable")
+
+    def budget_notice(self, thread_id, owner, notice, message_id):
+        result = self.request('thread-follower-start-turn', {'conversationId': thread_id,
+            'turnStart': {'request': {'threadId': thread_id, 'clientUserMessageId': message_id,
+                'input': [], 'toolOutput': {'name': 'budget_notice', 'namespace': 'task_dispatch_hub',
+                                          'output': json.dumps(notice, ensure_ascii=False)}},
+                'context': {'inheritThreadSettings': True}}}, 2, target=owner, timeout=35)
+        if result.get('resultType') != 'success':
+            raise RPCError('budget tool output outcome unknown: ' + str(result.get('error')))
+        return result.get('result', {})
 
     def close(self):
         self.socket.close()

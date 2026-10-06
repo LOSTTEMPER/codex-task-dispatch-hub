@@ -18,6 +18,7 @@ import re
 import sqlite3
 import sys
 import uuid
+from budget import Budgets, BUDGET_NOTICES, ACTIVE_NOTICES
 
 ROOT = Path(__file__).resolve().parent
 MANAGER = "manager"
@@ -25,6 +26,11 @@ STATES = {"idle", "working", "waiting", "submitted", "needs_user", "interrupted"
 TERMINAL = {"done", "cancelled", "superseded"}
 PRIORITIES = {"highest": 0, "high": 1, "medium": 2, "low": 3}
 PRIORITY_NAMES = ["最高", "高", "中", "低"]
+NOTIFICATION_POLICY = (
+    "纯知会、进度、完成留档使用 document_put/product_updates，不创建唤醒请求。"
+    "request 必须有接收方要执行的动作；wait 等结果，notify 是无需回叫但仍需处理的任务。"
+    "同一组依赖只登记一次 wait_for；收到重复或已处理结果直接结束，不重新等待，不发收到/完成回执。"
+)
 
 
 def now():
@@ -64,7 +70,7 @@ def refs(value):
     return out
 
 
-class Hub:
+class BaseHub:
     def __init__(self, root=ROOT):
         self.root = Path(root).resolve()
         self.state = self.root / ".state"
@@ -123,6 +129,8 @@ class Hub:
           summary TEXT NOT NULL,validation TEXT NOT NULL,refs TEXT NOT NULL,created TEXT NOT NULL,
           UNIQUE(role,id));
         """)
+
+        self.budgets = Budgets(self)
 
     def close(self):
         self.db.close()
@@ -184,6 +192,29 @@ class Hub:
     def identity(self, role):
         return json.loads(self.member(role)["card"])
 
+    def upgrade_identity_protocol(self, role):
+        self.require_manager(role)
+        updated = []
+        with self.transaction():
+            for member in self.db.execute("SELECT * FROM members").fetchall():
+                card = json.loads(member["card"])
+                if card.get("card_version") != "1.0" or "identity_block" not in card:
+                    continue
+                lines = card["identity_block"].splitlines()
+                for index, line in enumerate(lines):
+                    if line == "card_version: 1.0": lines[index] = "card_version: 1.2"
+                    elif line.startswith(("协作入口：", "hub_entry:")):
+                        lines[index] = f"协作入口：在 functions.exec 中通过 {self.root / 'native_call.js'} 执行 begin/end/request 等操作；程序自动登记并在应用原对话投递。身份不清楚时查询 hub.py call identity，身份以实际 CODEX_THREAD_ID 为准。"
+                    elif line.startswith(("每轮正式工作前", "turn_protocol:")):
+                        lines[index] = "每轮正式工作前 begin、最终回复前 end；业务协作只通过中枢 request/end，原生消息工具只由中枢程序领取登记后使用。用户可以直接向本对话提出需求。"
+                card["card_version"] = "1.2"
+                card["identity_block"] = "\n".join(lines)
+                self.db.execute("UPDATE members SET card=?,updated=? WHERE role=?", (dump(card), now(), member["role"]))
+                updated.append(member["role"])
+            if updated:
+                self.event(role, "identity_protocol_updated", "身份卡协作入口统一为 v1.2；角色绑定、职责和业务权限保持原值", version=self.current())
+        return {"card_version": "1.2", "updated_roles": updated}
+
     def active_run(self, role):
         return self.db.execute("SELECT * FROM runs WHERE role=? AND ended IS NULL", (role,)).fetchone()
 
@@ -197,7 +228,8 @@ class Hub:
                 # Retried begin is harmless. A different pending turn must not steal the run.
                 if request_ids and not set(request_ids).issubset(json.loads(run["request_ids"])):
                     raise ValueError("此角色已有执行轮次；不能覆盖。先核对旧轮次是否已结束。")
-                return {"run_id": run["id"], "state": "working", "duplicate": True}
+                return {"run_id": run["id"], "state": "working", "duplicate": True,
+                        "notification_policy": NOTIFICATION_POLICY}
             version = args.get("version") or self.current()
             if version:
                 self.version(version, writable=False)
@@ -217,8 +249,9 @@ class Hub:
                 self.db.execute("UPDATE outbox SET state='delivered',last_error=NULL,updated=? WHERE request_id=? AND kind='request' AND state IN ('sending','uncertain','pending')", (now(), request_id))
             if request_ids:
                 self.db.execute("UPDATE version_roles SET state='working' WHERE version=? AND role=?", (version, role))
+            budget = self.budgets.begin(role, args, identifier)
         self.render()
-        return {"run_id": identifier, "state": "working"}
+        return {"run_id": identifier, "state": "working", "notification_policy": NOTIFICATION_POLICY, "budget": budget}
 
     def get_request(self, identifier):
         row = self.db.execute("SELECT * FROM requests WHERE id=?", (identifier,)).fetchone()
@@ -270,6 +303,7 @@ class Hub:
         identifier = uid("request")
         self.db.execute("""INSERT INTO requests(id,version,sender,recipient,run_id,kind,priority,urgent,important,blocking,reason,title,action,acceptance,refs,required,status,created,updated,idempotency_key)
           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (identifier, version["id"], role, recipient, run["id"] if run else None, kind, priority, int(urgent), int(important), blocking, reason, title, action, acceptance, dump(references), int(required), "queued", now(), now(), args["idempotency_key"]))
+        self.budgets.attach_request(role, args, identifier, recipient)
         if required and version["state"] == "awaiting_review":
             self.db.execute("UPDATE versions SET state='active',epoch=epoch+1,updated=? WHERE id=?", (now(), version["id"]))
             self.db.execute("UPDATE outbox SET state='cancelled',updated=? WHERE version=? AND kind='review_ready' AND state='pending'", (now(), version["id"]))
@@ -314,7 +348,8 @@ class Hub:
             dependencies = args.get("wait_for", [])
             if not isinstance(dependencies, list) or len(dependencies) > 30:
                 raise ValueError("wait_for 须为至多 30 项列表")
-            if state == "waiting" and not dependencies:
+            budget_wait = self.budgets.check_wait(role, args)
+            if state == "waiting" and not dependencies and not budget_wait:
                 raise ValueError("等待协作必须列出 wait_for 请求编号；等待用户请用 needs_user")
             if dependencies and state != "waiting":
                 raise ValueError("wait_for 只能与 waiting 一起使用")
@@ -322,6 +357,9 @@ class Hub:
                 req = self.get_request(dep)
                 if req["sender"] != role or req["kind"] != "wait" or req["version"] != run["version"]:
                     raise PermissionError("只能等待本版本自己发起的 wait 请求")
+            dependencies = sorted(set(dependencies))
+            if dependencies:
+                self.version(run["version"])
             outstanding_wait = self.db.execute("SELECT id FROM requests WHERE run_id=? AND kind='wait' AND status NOT IN ('done','cancelled','superseded')", (identifier,)).fetchall()
             if any(row[0] not in dependencies for row in outstanding_wait):
                 raise ValueError("本轮仍有等待结果的请求，须在 wait_for 中登记后休眠")
@@ -331,7 +369,9 @@ class Hub:
                     raise ValueError("仍有必需协作任务未完成，不能将本端标记已提交")
             self.db.execute("UPDATE runs SET state=?,ended=?,summary=? WHERE id=?", (state, now(), summary, identifier))
             if dependencies:
-                self.db.execute("INSERT INTO barriers VALUES(?,?,?,?,0)", (identifier, role, run["version"], dump(dependencies)))
+                existing = self.db.execute("SELECT dependencies FROM barriers WHERE role=? AND version=? AND fired=0", (role, run["version"])).fetchall()
+                if not any(sorted(set(json.loads(row["dependencies"]))) == dependencies for row in existing):
+                    self.db.execute("INSERT INTO barriers VALUES(?,?,?,?,0)", (identifier, role, run["version"], dump(dependencies)))
                 self._check_cycles()
             if state in {"submitted", "waiting", "needs_user", "interrupted"}:
                 self.db.execute("UPDATE version_roles SET state=?,summary=? WHERE version=? AND role=?", (state, summary, run["version"], role))
@@ -365,9 +405,17 @@ class Hub:
             failed = any(r["status"] in {"cancelled", "superseded", "blocked"} for r in dependencies)
             ready = all(r["status"] == "done" for r in dependencies)
             if failed or ready:
-                self.enqueue(barrier["role"], "dependency_ready", "barrier:" + barrier["id"], {
+                # A result belongs to a dependency set, not to each turn that
+                # happened to register the same wait. State changes still get
+                # a distinct key (for example blocked -> done).
+                snapshot = sorted((r["id"], r["revision"], r["status"]) for r in dependencies)
+                fingerprint = hashlib.sha256(dump([barrier["role"], barrier["version"], snapshot]).encode()).hexdigest()
+                version = self.version(barrier["version"], writable=False)
+                self.enqueue(barrier["role"], "dependency_ready", "dependencies:" + fingerprint, {
                     "summary": "依赖发生撤回/阻塞，请调整安排。" if failed else "等待的协作结果已齐，可以继续工作。",
-                    "request_ids": [r["id"] for r in dependencies]}, min(r["priority"] for r in dependencies), version=barrier["version"])
+                    "request_ids": [r["id"] for r in dependencies],
+                    "review_required": barrier["role"] == MANAGER and version["state"] == "awaiting_review"},
+                    min(r["priority"] for r in dependencies), version=barrier["version"])
                 self.db.execute("UPDATE barriers SET fired=1 WHERE id=?", (barrier["id"],))
         for version in self.db.execute("SELECT * FROM versions WHERE state='active'").fetchall():
             roles = self.db.execute("SELECT state FROM version_roles WHERE version=?", (version["id"],)).fetchall()
@@ -375,6 +423,42 @@ class Hub:
             if roles and all(r[0] == "submitted" for r in roles) and not pending:
                 self.db.execute("UPDATE versions SET state='awaiting_review',updated=? WHERE id=?", (now(), version["id"]))
                 self.enqueue(MANAGER, "review_ready", f"review:{version['id']}:{version['epoch']}", {"summary": "本版本所有必需参与方均已提交，协作请求已收束。请按需读取文档，自行决定核验或后续安排。"}, 1, version=version["id"])
+        self.reconcile_wakeups()
+
+    def archive_wakeup(self, row, reason):
+        """Retain the original notice as an audit record without dispatching it."""
+        payload = json.loads(row["payload"])
+        payload["archive_reason"] = reason
+        self.db.execute("UPDATE outbox SET state='archived',payload=?,last_error=NULL,updated=? WHERE id=? AND state='pending'",
+                        (dump(payload), now(), row["id"]))
+
+    def reconcile_wakeups(self):
+        """Transaction-owned, model-free coalescing, shared by both transports."""
+        self.budgets.reconcile()
+        # Retire uncertain results from explicitly closed versions without
+        # pretending they were read and without risking another delivery.
+        for old in self.db.execute("SELECT o.* FROM outbox o JOIN versions v ON v.id=o.version WHERE o.state='uncertain' AND o.kind IN ('dependency_ready','review_ready') AND v.state IN ('accepted','archived')").fetchall():
+            payload = json.loads(old['payload']);payload['archive_reason'] = 'closed_version_uncertain_not_retried'
+            self.db.execute("UPDATE outbox SET state='archived',payload=?,updated=? WHERE id=?", (dump(payload),now(),old['id']))
+        for row in self.db.execute("SELECT * FROM outbox WHERE state='pending' AND kind IN ('dependency_ready','review_ready')").fetchall():
+            version = self.version(row["version"], writable=False)
+            if version["state"] in {"accepted", "archived"}:
+                self.archive_wakeup(row, "version_closed")
+            elif row["kind"] == "review_ready" and version["state"] != "awaiting_review":
+                self.archive_wakeup(row, "review_no_longer_required")
+
+        # A manager waiting for results needs a single continuation, with the
+        # review decision included. Readiness alone must not wake it earlier.
+        for row in self.db.execute("SELECT * FROM outbox WHERE state='pending' AND kind='review_ready'").fetchall():
+            result = self.db.execute("SELECT * FROM outbox WHERE state='pending' AND kind='dependency_ready' AND recipient=? AND version=? ORDER BY priority,created,id LIMIT 1",
+                                     (row["recipient"], row["version"])).fetchone()
+            if result:
+                payload = json.loads(result["payload"])
+                payload["review_required"] = True
+                self.db.execute("UPDATE outbox SET payload=?,updated=? WHERE id=?", (dump(payload), now(), result["id"]))
+                self.archive_wakeup(row, "review_merged_into_dependency_result")
+            elif self.db.execute("SELECT 1 FROM barriers WHERE role=? AND version=? AND fired=0", (row["recipient"], row["version"])).fetchone():
+                self.archive_wakeup(row, "manager_waiting_for_dependencies")
 
     def update_request(self, role, args):
         with self.transaction():
@@ -477,10 +561,13 @@ class Hub:
                 raise ValueError("只有待验收版本可以由总管理标记接受")
             if decision != "hold":
                 self.db.execute("UPDATE versions SET state=?,updated=? WHERE id=?", (decision, now(), v["id"]))
-                # A manager already reviewing the facts needs no stale wake afterwards.
-                self.db.execute("UPDATE outbox SET state='completed',updated=? WHERE version=? AND kind='review_ready' AND recipient=? AND state='pending'", (now(), v["id"], role))
+            # Even a hold is an explicit review decision, not a reason to
+            # deliver the same readiness notice again after this turn.
+            for notice in self.db.execute("SELECT * FROM outbox WHERE version=? AND kind='review_ready' AND recipient=? AND state='pending'", (v["id"], role)).fetchall():
+                self.archive_wakeup(notice, "manager_reviewed")
             if decision == "archived":
                 self.db.execute("UPDATE outbox SET state='cancelled',updated=? WHERE version=? AND state='pending'", (now(), v["id"]))
+            self.reconcile_wakeups()
             self.event(role, "version_" + decision, note, version=v["id"])
         self.render()
         return {"version": v["id"], "decision": decision}
@@ -505,9 +592,13 @@ class Hub:
                 "members": [{"role": row["role"], "label": row["label"], "state": (self.active_run(row["role"]) or {"state": "idle"})["state"]} for row in self.db.execute("SELECT role,label FROM members")],
                 "delivery_counts": {row[0]: row[1] for row in self.db.execute("SELECT state,COUNT(*) FROM outbox GROUP BY state")},
                 "worker": self.meta("worker", {}),
-                "delivery_issues": [dict(x) for x in self.db.execute("SELECT id,recipient,state,last_error FROM outbox WHERE state IN ('uncertain','failed') ORDER BY created DESC LIMIT 10")]}
+                "budget_enabled": self.meta("budget_enabled", False),
+                "budget_collector": self.meta("budget_collector", {}),
+                "delivery_issues": [dict(x) for x in self.db.execute("SELECT id,recipient,state,last_error FROM outbox WHERE state IN ('uncertain','failed') OR (state='pending' AND last_error IS NOT NULL) ORDER BY created DESC LIMIT 10")]}
 
     def message(self, delivery):
+        if delivery['kind'] in BUDGET_NOTICES:
+            return '[任务预算中枢]\n' + dump(self.budgets.notice(delivery))
         payload = json.loads(delivery["payload"])
         lines = ["[任务调度中枢]", f"投递编号：{delivery['id']}", f"版本：{delivery['version']}"]
         if delivery["kind"] == "request":
@@ -517,17 +608,24 @@ class Hub:
                       f"优先级理由：{r['reason']}", f"事项：{r['title']}", f"行动：{r['action']}", f"完成条件：{r['acceptance']}"]
             for ref in json.loads(r["refs"]): lines.append(f"按需参考：{ref['path']}（{ref['revision']}）")
             lines.append(f"正式工作前调用中枢 begin，request_ids 填 [\"{r['id']}\"]。收尾时调用 end 提交此请求结果；没有额外协作需要就结束本轮。")
+            budget_id = self.budgets.request_budget(r['id'])
+            if budget_id:
+                lines.append('任务软预算（含全部后代，实际计数）：' + dump(self.budgets.view(budget_id)))
+                lines.append('begin 后先 budget_estimate 估算路径与收束余量；到额 budget_report 并 end waiting+budget_review_id，由总管裁定。操作参数见 README 预算部分。')
         else:
             lines.append(payload.get("summary", "协作状态发生需要处理的变化。"))
+            if payload.get("review_required"):
+                lines.append("本版本也已进入待验收；请在处理这些结果时一并决定核验、返工或接受，不再另发状态唤醒。")
             identifiers = payload.get("request_ids", []) + ([payload["request_id"]] if payload.get("request_id") else [])
             for identifier in identifiers:
                 r = self.get_request(identifier)
                 lines.append(f"关联请求 {identifier}：{r['title']}；状态 {r['status']}；结果 {r['result']}")
                 for ref in json.loads(r["result_refs"]): lines.append(f"结果资料：{ref['path']}（{ref['revision']}）")
             lines.append("正式工作前调用 begin；此消息是结果/状态事件，不要把已完成的关联请求当作新的待执行请求接手。")
-        lines += [f"中枢入口：python3 '{self.root / 'hub.py'}' call <操作>（JSON 参数从标准输入传入）",
+        lines += [f"中枢 v1.2 标准入口：在 functions.exec 中读取并执行 {self.root / 'native_call.js'}；把 tools、操作名、JSON 对象传入，程序自动登记及原生投递。纯 CLI 写入后须通过此入口 drain。",
                   f"协作使用说明：{self.root / 'README.md'}；团队入口：{self.root / 'docs' / 'index.md'}，均按需读取。",
-                  "身份或权限不清楚时主动调用 identity。禁止使用任务间直接发消息工具进行协作；通过中枢 request/end。不要为确认收到而创建新请求。"]
+                  "身份或权限不清楚，或保存的身份卡早于 v1.2 时，主动调用 identity。业务协作通过中枢 request/end；只有中枢程序可领取已登记记录后使用原生消息工具。不要为确认收到而创建新请求。"]
+        lines.append(NOTIFICATION_POLICY)
         return "\n".join(lines)
 
     def render(self):
@@ -592,7 +690,56 @@ class Hub:
 
     def call(self, thread_id, operation, args):
         role = self.actor(thread_id)
+        if operation in ('delivery_claim_native','budget_decide','budget_view','budget_review_get','begin'):
+            from usage import UsageCollector
+            UsageCollector(self).collect()
+        if operation.startswith('budget_'):
+            return self.budgets.call(role, operation, args)
+        if operation == "delivery_candidates":
+            with self.transaction():
+                self.reconcile_wakeups()
+            # One candidate per recipient: a busy role's backlog must not hide
+            # another role that needs the native bridge to load its thread.
+            candidates, seen = [], set()
+            for row in self.db.execute("SELECT o.id delivery_id,o.recipient,m.thread_id FROM outbox o JOIN members m ON m.role=o.recipient WHERE o.state='pending' AND COALESCE(o.route,'')!='desktop-owner-retry' AND o.kind NOT IN ('budget_warning','budget_limit') ORDER BY o.priority,o.created,o.id"):
+                if row["recipient"] in seen or row["thread_id"] == thread_id:
+                    continue
+                seen.add(row["recipient"])
+                candidates.append(dict(row))
+                if len(candidates) == 8:
+                    break
+            return {"calling_thread_id": thread_id, "deliveries": candidates}
+        if operation == "delivery_claim_native":
+            with self.transaction():
+                self.reconcile_wakeups()
+                row = self.db.execute("SELECT * FROM outbox WHERE id=?", (args["delivery_id"],)).fetchone()
+                if row and row["state"] in {"archived", "cancelled"}:
+                    return {"delivery_id": row["id"], "state": row["state"], "skipped": True}
+                if not row or row["state"] != "pending": raise ValueError("只领取待发送的中枢记录，禁止重复发送")
+                if self.active_run(row["recipient"]): raise ValueError("接收方已有工作登记，先核对当前执行")
+                if row['kind'] in ACTIVE_NOTICES:
+                    raise ValueError('预算即时提醒由原对话工具输出通道投递')
+                if self.db.execute("SELECT 1 FROM outbox WHERE recipient=? AND state IN ('sending','delivered','uncertain') AND kind NOT IN ('budget_warning','budget_limit')", (row["recipient"],)).fetchone():
+                    raise ValueError("接收方已有投递执行中或结果待确认")
+                if row["request_id"] and row["kind"] == "request" and self.get_request(row["request_id"])["status"] in TERMINAL:
+                    raise ValueError("请求已经结束，不得再次发送")
+                self.db.execute("UPDATE outbox SET state='sending',route='desktop-native',turn_id=NULL,attempts=attempts+1,last_error=NULL,updated=? WHERE id=?", (now(), row["id"]))
+                self.budgets.prepare_delivery(row)
+                self.set_meta("native_claim:" + row["id"], role)
+                self.event(role, "native_delivery_claimed", "由中枢领取，使用 Codex 应用原生入口投递，禁止独立执行引擎", row["request_id"], row["version"])
+                return {"delivery_id": row["id"], "thread_id": self.member(row["recipient"])["thread_id"], "message": self.message(row)}
+        if operation == "delivery_receipt_native":
+            with self.transaction():
+                row = self.db.execute("SELECT * FROM outbox WHERE id=?", (args["delivery_id"],)).fetchone()
+                if not row or row["route"] != "desktop-native" or row["state"] not in {"sending", "delivered"}: raise ValueError("无匹配的原生投递领取记录")
+                if role != MANAGER and self.meta("native_claim:" + row["id"]) != role: raise PermissionError("只有领取者或总管理可登记原生投递回执")
+                confirmed = args.get("confirmed") is True
+                self.db.execute("UPDATE outbox SET state=?,turn_id=?,last_error=?,updated=? WHERE id=?", ("delivered" if confirmed else "uncertain", args.get("turn_id"), None if confirmed else "原生投递结果未确认，禁止盲目重发", now(), row["id"]))
+                if confirmed:
+                    self.budgets.receipt_turn(row, args.get('turn_id'))
+                return {"delivery_id": row["id"], "state": "delivered" if confirmed else "uncertain"}
         if operation == "identity": return self.identity(role)
+        if operation == "identity_protocol_update": return self.upgrade_identity_protocol(role)
         if operation == "begin": return self.begin(role, args)
         if operation == "end": return self.end(role, args)
         if operation == "request": return self.request(role, args)
@@ -616,8 +763,18 @@ class Hub:
                 row = self.db.execute("SELECT * FROM outbox WHERE id=?", (args["delivery_id"],)).fetchone()
                 if not row or row["state"] not in {"failed", "uncertain"}: raise ValueError("仅重试失败或结果待确认的投递")
                 self.db.execute("UPDATE outbox SET state='pending',available_at=0,updated=? WHERE id=?", (now(), row["id"]))
+                if args.get('prefer_owner') is True:
+                    evidence = short(args.get('verified_not_received'), '未送达及原对话owner核对证据', 800)
+                    self.db.execute("UPDATE outbox SET route='desktop-owner-retry' WHERE id=?", (row['id'],))
+                    self.event(role,'owner_delivery_retry',evidence,row['request_id'],row['version'])
             return {"delivery_id": row["id"], "state": "pending"}
         raise ValueError("未知操作: " + operation)
+
+
+from dispatch_extensions import DispatchExtensions
+
+class Hub(DispatchExtensions, BaseHub):
+    """Portable ledger with the deployed cycle and native-receipt fixes."""
 
 
 def main():
