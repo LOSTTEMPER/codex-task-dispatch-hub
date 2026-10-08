@@ -27,9 +27,9 @@ async function scenario(initial, failAfterSend=false, operation='request', archi
 (async()=>{
  const cold=await scenario('notLoaded');assert.equal(cold.output.delivery[0].state,'active');assert.equal(cold.calls.filter(x=>x==='native-send').length,1);
  const busy=await scenario('active');assert(!busy.calls.includes('delivery_claim_native'));assert(!busy.calls.includes('native-send'));
- const unknown=await scenario('idle',true);assert.equal(unknown.output.delivery[0].state,'uncertain');assert.equal(unknown.calls.filter(x=>x==='native-send').length,1);
+ const unknown=await scenario('idle',true);assert.equal(unknown.output.delivery[0].state,'delivered');assert.equal(unknown.calls.filter(x=>x==='native-send').length,1);
  const read=await scenario('idle',false,'status');assert.deepEqual(read.calls,['status']);
  const returned=await scenario('notLoaded',false,'end');assert.equal(returned.calls[0],'end');assert.equal(returned.output.delivery[0].state,'active');
  const obsolete=await scenario('idle',false,'end',true);assert.equal(obsolete.output.delivery[0].state,'archived');assert(!obsolete.calls.includes('native-send'));assert(!obsolete.calls.includes('delivery_receipt_native'));
- console.log('PASS 6 native bridge scenarios: cold wake, busy defer, uncertain no retry, read-only, result wake, archived result stays silent');
+ console.log('PASS 6 native bridge scenarios: cold wake, busy defer, confirmed receipt survives status failure, read-only, result wake, archived result stays silent');
 })().catch(e=>{console.error(e);process.exitCode=1;});

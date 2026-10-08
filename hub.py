@@ -578,6 +578,12 @@ class BaseHub:
             for notice in self.db.execute("SELECT * FROM outbox WHERE version=? AND kind='review_ready' AND recipient=? AND state='pending'", (v["id"], role)).fetchall():
                 self.archive_wakeup(notice, "manager_reviewed")
             if decision == "archived":
+                # Archiving is an atomic interruption of this version's work,
+                # including waits not yet registered as a barrier. Retain rows.
+                self.db.execute("UPDATE requests SET status='cancelled',revision=revision+1,updated=? WHERE version=? AND status NOT IN ('done','cancelled','superseded')", (now(), v['id']))
+                self.db.execute("UPDATE barriers SET fired=1 WHERE version=? AND fired=0", (v['id'],))
+                self.db.execute("UPDATE runs SET state='interrupted',ended=?,summary=? WHERE version=? AND ended IS NULL", (now(), note, v['id']))
+                self.db.execute("UPDATE version_roles SET state='interrupted',summary=? WHERE version=? AND state!='submitted'", (note, v['id']))
                 self.db.execute("UPDATE outbox SET state='cancelled',updated=? WHERE version=? AND state='pending'", (now(), v["id"]))
             self.reconcile_wakeups()
             self.event(role, "version_" + decision, note, version=v["id"])
@@ -736,8 +742,41 @@ class BaseHub:
                 body.append(f"- v1.{r['revision']} · {r['created']} · {r['actor']}：{r['note']}" + (f"（关联 {r['request_id']}）" if r["request_id"] else ""))
             write(f"documents/{d['key']}.md", "\n".join(body) + "\n")
 
+    def native_message_descriptor(self, row):
+        message = self.meta('native_message:' + row['id'])
+        if not isinstance(message, str):
+            raise ValueError('缺少原投递消息快照，保留领取等待核对')
+        encoded = json.dumps(message, ensure_ascii=True)
+        return {'delivery_id': row['id'], 'thread_id': self.member(row['recipient'])['thread_id'],
+                'message_size': len(encoded), 'message_key': hashlib.sha256(encoded.encode('ascii')).hexdigest()}
+
     def call(self, thread_id, operation, args):
         role = self.actor(thread_id)
+        if operation in {'delivery_claim_native_result', 'delivery_message_native', 'delivery_release_native'}:
+            with self.transaction():
+                row = self.db.execute('SELECT * FROM outbox WHERE id=?', (args.get('delivery_id'),)).fetchone()
+                if not row or row['route'] != 'desktop-native':
+                    raise ValueError('无匹配原生领取')
+                if role != MANAGER and self.meta('native_claim:' + row['id']) != role:
+                    raise PermissionError('只有领取者或总管理可读取原领取')
+                if operation in {'delivery_claim_native_result', 'delivery_release_native'}:
+                    token = self.meta('native_claim_token:' + row['id'])
+                    if not token or token != args.get('claim_token') or row['state'] != 'sending':
+                        raise ValueError('无匹配的当前领取令牌，禁止重领')
+                if operation == 'delivery_release_native':
+                    self.db.execute("UPDATE outbox SET state='pending',last_error='原生入口确认尚未调用发送',updated=? WHERE id=?", (now(), row['id']))
+                    self.budgets.cancel_unsent(row)
+                    self.event(role, 'native_claim_released_unsent', '原生入口尚未调用发送，安全释放领取', row['request_id'], row['version'])
+                    return {'delivery_id': row['id'], 'state': 'pending'}
+                descriptor = self.native_message_descriptor(row)
+                if operation == 'delivery_claim_native_result':
+                    return descriptor
+                offset = args.get('offset')
+                if type(offset) is not int or offset < 0 or offset >= descriptor['message_size'] or args.get('message_key') != descriptor['message_key']:
+                    raise ValueError('原消息分块标识或偏移无效')
+                encoded = json.dumps(self.meta('native_message:' + row['id']), ensure_ascii=True)
+                chunk = encoded[offset:offset+2048]
+                return {'offset': offset, 'next_offset': offset+len(chunk), 'chunk': chunk, **descriptor}
         if operation in ('delivery_claim_native','budget_decide','budget_view','budget_review_get','begin'):
             from usage import UsageCollector
             UsageCollector(self).collect()
@@ -769,6 +808,9 @@ class BaseHub:
                     self.set_meta('native_candidate_cursor', candidates[-1]['delivery_id'])
             return {'calling_thread_id': thread_id, 'deliveries': candidates}
         if operation == "delivery_claim_native":
+            claim_token = args.get('claim_token')
+            if claim_token is not None:
+                short(claim_token, '领取令牌', 100)
             with self.transaction():
                 self.reconcile_wakeups()
                 row = self.db.execute("SELECT * FROM outbox WHERE id=?", (args["delivery_id"],)).fetchone()
@@ -787,9 +829,12 @@ class BaseHub:
                 self.db.execute("UPDATE outbox SET state='sending',route='desktop-native',turn_id=NULL,attempts=attempts+1,last_error=NULL,updated=? WHERE id=?", (now(), row["id"]))
                 self.budgets.prepare_delivery(row)
                 self.set_meta("native_claim:" + row["id"], role)
+                self.set_meta('native_claim_token:' + row['id'], claim_token)
                 self.event(role, "native_delivery_claimed", "由中枢领取，使用 Codex 应用原生入口投递，禁止独立执行引擎", row["request_id"], row["version"])
                 message = self.message(row)
                 self.set_meta('native_message:' + row['id'], message)
+                if args.get('message_chunks') is True:
+                    return self.native_message_descriptor(row)
                 return {"delivery_id": row["id"], "thread_id": self.member(row["recipient"])["thread_id"], "message": message}
         if operation == "delivery_receipt_native":
             with self.transaction():

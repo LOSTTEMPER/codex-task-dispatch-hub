@@ -125,7 +125,12 @@ class Worker:
                 self.hub.db.execute("UPDATE outbox SET state='sending',attempts=attempts+1,route='desktop-owner',updated=? WHERE id=?",(now(),row['id']))
                 self.hub.budgets.prepare_delivery(row,active_turn=live['status']=='active')
             tid=self.hub.member(role)['thread_id']
-            if self.monitor_stop.is_set():raise InterruptedError('worker stopping before send')
+            if self.monitor_stop.is_set():
+                # No send call has started: this claim is safe to release.
+                with self.hub.transaction():
+                    self.hub.db.execute("UPDATE outbox SET state='pending',last_error='worker stopped before send',updated=? WHERE id=? AND state='sending' AND route='desktop-owner'", (now(), row['id']))
+                    self.hub.budgets.cancel_unsent(row)
+                return False
             if immediate:
                 result=ipc.budget_notice(tid,owner,self.hub.budgets.notice(row),row['id'])
             else:

@@ -310,7 +310,7 @@ records.
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 node tests/native_call_test.cjs
-node --test tests/native-reconcile.test.mjs tests/native-audit.test.mjs
+node --test tests/native-reconcile.test.mjs tests/native-audit.test.mjs tests/native-review2.test.mjs
 ```
 
 The test suite covers identity isolation, idempotency, priority, grouped waits,
@@ -320,6 +320,9 @@ desktop busy-state handling.
 
 Synthetic performance results and the F01–F23 repair matrix are in
 [`validation/audit-fixes-20261006.md`](validation/audit-fixes-20261006.md).
+The second-review R01–R08 repairs and verification boundaries are in
+[`validation/review2-fixes-20261008.md`](validation/review2-fixes-20261008.md).
+
 To repeat the five-round before/after benchmark (CPU intensive baseline):
 
 ```sh
@@ -336,6 +339,35 @@ No running deployment, database, team binding, or worker is migrated by this
 source update. Stop a worker and back up its private state before upgrading that
 deployment; never copy another team's state. Existing 1.0 identity cards can be
 upgraded by the manager using `identity_protocol_update`.
+
+## Second-review upgrade notes
+
+Upgrade the shared Python modules and `native_call.js` together. The native
+bridge now claims bounded metadata, then reads immutable 2,048-character ASCII
+JSON fragments. A lost claim reply is recovered using the same claim token;
+a fragment can be reread without claiming or sending again. Internal release
+is permitted only before the bridge has invoked send. Once send starts, an
+unknown outcome remains uncertain and must not be blindly retried.
+
+Archiving atomically interrupts active runs, cancels outstanding requests and
+retires wait barriers while preserving every history row. The manager can
+repeat `version_review` with `decision=archived` and an explicit version ID to
+repair a previously archived version with stranded runs; this is an explicit
+administrative action, not an automatic rewrite of old team state.
+
+Budget assignments no longer charge the next turn based on time. A real turn
+receipt or the recipient's explicit `begin` binds work. Pending counters may
+remain unmanaged until that evidence arrives; late exact receipts backfill
+retained counters. Historical misattribution and pre-existing gaps are not
+silently reconstructed. Malformed/overflowing counters retain the safe cursor
+and mark a source gap. The first atomic projection installation also reseeds
+all existing history pages once to repair views missed by the older installer.
+
+`control.py stop` uses the fixed local control socket before opening any ledger.
+Control frames are newline-terminated with size caps and an overall deadline;
+there is no PID-signal fallback. A worker already running older code needs a
+controlled restart to load this implementation. These source changes do not
+upgrade another team's checkout or start a worker.
 
 ## License
 

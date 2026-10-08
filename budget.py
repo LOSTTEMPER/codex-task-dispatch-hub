@@ -61,6 +61,7 @@ class Budgets:
           counters TEXT NOT NULL,observed TEXT NOT NULL,recorded TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS budget_usage_account ON budget_usage(budget_id);
         CREATE INDEX IF NOT EXISTS budget_usage_turn ON budget_usage(thread_id,turn_id);
+        CREATE INDEX IF NOT EXISTS budget_usage_version ON budget_usage(version);
         CREATE TABLE IF NOT EXISTS budget_reviews(
           id TEXT PRIMARY KEY,budget_id TEXT NOT NULL REFERENCES budgets(id),state TEXT NOT NULL,
           revision INTEGER NOT NULL DEFAULT 1,report TEXT NOT NULL,decision TEXT,
@@ -178,6 +179,11 @@ class Budgets:
                             (tid, identifier, row['version'], kind, row['id'], stamp()))
         else:
             self.db.execute('DELETE FROM budget_assignments WHERE thread_id=?', (self.h.member(row['recipient'])['thread_id'],))
+
+    def cancel_unsent(self, row):
+        """Release only attribution owned by this definitely unsent delivery."""
+        self.db.execute('DELETE FROM budget_assignments WHERE delivery_id=? AND thread_id=?',
+                        (row['id'], self.h.member(row['recipient'])['thread_id']))
 
     def bind_turn(self, thread, turn, identifier, version, kind='work', started=None):
         old = self.db.execute('SELECT * FROM budget_turns WHERE thread_id=? AND turn_id=?', (thread, turn)).fetchone()

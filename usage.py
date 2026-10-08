@@ -7,6 +7,14 @@ from pathlib import Path
 import sqlite3
 from budget import stamp, encode
 
+MAX_COUNTER = 2**63 - 1
+
+
+def counter(value):
+    if type(value) is not int or not 0 <= value <= MAX_COUNTER:
+        raise ValueError('token counter must be a nonnegative signed 64-bit integer')
+    return value
+
 
 class UsageCollector:
     def __init__(self, hub, catalog=None, cancel=None):
@@ -125,7 +133,6 @@ class UsageCollector:
             if not s['turn_id']:
                 s.update(quality='gap', issue='task_started missing turn id'); return
             binding = self.db.execute('SELECT * FROM budget_turns WHERE thread_id=? AND turn_id=?', (tid, s['turn_id'])).fetchone()
-            assignment = self.db.execute('SELECT * FROM budget_assignments WHERE thread_id=?', (tid,)).fetchone()
             # A root_turn_id comes from Codex, and avoids guessing child ownership
             # from titles, working directories or temporal proximity.
             inherited = s['inherited_budget']
@@ -134,10 +141,9 @@ class UsageCollector:
                 parent = self.db.execute('SELECT inherited_budget FROM budget_sources WHERE thread_id=?', (s['parent_thread_id'],)).fetchone()
                 inherited = (parent[0] if parent else None) or (ancestor[0] if ancestor else None)
                 s['inherited_budget'] = inherited
-            if not binding and assignment and observed >= assignment['created']:
-                self.h.budgets.bind_turn(tid, s['turn_id'], assignment['budget_id'], assignment['version'], assignment['kind'], observed)
-                self.db.execute('DELETE FROM budget_assignments WHERE thread_id=?', (tid,))
-            elif not prime and not binding and inherited:
+            # An assignment is intent, not evidence that this native turn was
+            # sent by it. receipt_turn or explicit begin binds actual root work.
+            if not prime and not binding and inherited:
                 b = self.h.budgets.account(inherited)
                 self.h.budgets.bind_turn(tid, s['turn_id'], inherited, b['version'], started=observed)
             elif binding:
@@ -152,28 +158,53 @@ class UsageCollector:
                 raise ValueError('invalid token usage shape')
             totals = info.get('total_token_usage', {}); total = totals.get('total_tokens')
             last = info.get('last_token_usage', {}).get('total_tokens')
-            if not isinstance(total, int) or total < 0:
-                s.update(quality='gap', issue='invalid cumulative counter'); return
-            previous = s['total']; s['total'] = total
+            counter(total)
+            if last is not None:
+                counter(last)
+                if last > total:
+                    raise ValueError('last token usage exceeds cumulative counter')
+            names = ('total_tokens','input_tokens','cached_input_tokens','cache_write_input_tokens','output_tokens','reasoning_output_tokens')
+            for counters in (totals, info.get('last_token_usage', {})):
+                for key in names:
+                    if key in counters: counter(counters[key])
+            previous = s['total']
+            if previous is not None: counter(previous)
+            if previous is not None and total < previous: counter(s['epoch'] + 1)
             binding = self.db.execute('SELECT * FROM budget_turns WHERE thread_id=? AND turn_id=?', (tid,s['turn_id'])).fetchone()
             if prime and not binding:
-                return
+                assignment = self.db.execute('SELECT created FROM budget_assignments WHERE thread_id=?', (tid,)).fetchone()
+                # Retain post-assignment counters as UNMANAGED evidence so a
+                # later actual turn receipt can backfill them. Time never binds.
+                if not assignment or not s['turn_started'] or s['turn_started'] < assignment['created']:
+                    s['total'] = total
+                    return
             if previous is None:
                 # Fork history can seed a cumulative total; only its first new
                 # model response is chargeable. Last usage is not added twice.
                 delta = last if isinstance(last, int) and 0 <= last <= total else None
             elif total < previous:
-                s['epoch'] += 1
-                s.update(quality='gap', issue='counter reset; first response only, gap retained')
                 delta = last if isinstance(last, int) and 0 <= last <= total else None
             else:
                 delta = total - previous
             if delta is None:
+                s['total'] = total
                 s.update(quality='gap', issue='initial usage unavailable'); return
-            if delta == 0:
-                return
             binding = self.db.execute('SELECT * FROM budget_turns WHERE thread_id=? AND turn_id=?', (tid,s['turn_id'])).fetchone()
             event = hashlib.sha256(encode([tid,s['path'],s['inode'],offset]).encode()).hexdigest()
-            counters = {k:v for k,v in totals.items() if k in ('total_tokens','input_tokens','cached_input_tokens','cache_write_input_tokens','output_tokens','reasoning_output_tokens') and isinstance(v,int)}
+            if delta and not self.db.execute('SELECT 1 FROM budget_usage WHERE event_id=?', (event,)).fetchone():
+                # Keep every SQLite SUM used by account/version views in range.
+                # Reject the source record before changing its safe baseline.
+                if binding and binding['budget_id']:
+                    counter(self.h.budgets.used(binding['budget_id']) + delta)
+                if binding and binding['version']:
+                    used = self.db.execute('SELECT COALESCE(SUM(tokens),0) FROM budget_usage WHERE version=?', (binding['version'],)).fetchone()[0]
+                    counter(used + delta)
+            s['total'] = total
+            if previous is not None and total < previous:
+                s['epoch'] += 1
+                s.update(quality='gap', issue='counter reset; first response only, gap retained')
+            if delta == 0:
+                return
+            counters = {k:v for k,v in totals.items() if k in names}
             self.db.execute('INSERT OR IGNORE INTO budget_usage VALUES(?,?,?,?,?,?,?,?,?,?)',
                 (event,tid,s['turn_id'],binding['budget_id'] if binding else None,binding['version'] if binding else None,binding['kind'] if binding else 'unmanaged',delta,encode(counters),observed,stamp()))

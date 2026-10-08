@@ -253,14 +253,16 @@ class BudgetAuditTests(unittest.TestCase):
         for _ in range(2):self.c.collect();self.assertEqual(self.used(),100)
         self.assertEqual(self.h.budgets.view(self.b)['coverage'],'complete')
 
-    def test_f18_first_assignment_excludes_old_history(self):
+    def test_f18_first_confirmed_assignment_excludes_old_history(self):
         self.reset_source()
         self.event('t-a','task_started',turn_id='old');self.tokens('t-a',900)
         with self.h.transaction():
             self.h.db.execute('INSERT INTO budget_assignments VALUES(?,?,?,?,?,?)',('t-a',self.b,'v1','work','delivery','2000'))
-        # Explicit assignment boundary: historic event timestamps precede it.
+        # An assignment alone is no longer evidence of a delivered native turn.
         p=self.root/'t-a.jsonl';p.write_text(p.read_text().replace(now(),'1999'))
         self.event('t-a','task_started',turn_id='new');self.tokens('t-a',1000,100)
+        with self.h.transaction():
+            self.h.budgets.receipt_turn({'recipient':'a','id':'delivery'}, 'new')
         self.c.collect();self.assertEqual(self.used(),100)
 
     def test_f19_first_missing_file_recovers_but_replacement_does_not(self):

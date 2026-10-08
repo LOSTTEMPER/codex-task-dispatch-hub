@@ -43,7 +43,7 @@ function fixture({idle=false, missing=false, unrelated=false, asyncClaim=false, 
 }
 for(const mode of [{idle:true},{missing:true}])test('F06 completed or missing snapshot associates exact sent user message '+JSON.stringify(mode),async()=>{
   const f=fixture(mode);await run(f.tools,'drain',{});
-  assert.equal(f.receipts[0].turn_id,'verified');assert.equal(f.calls.filter(x=>x==='send').length,1);
+  assert.equal(f.receipts[0].confirmed,true);assert.equal(f.receipts.at(-1).turn_id,'verified');assert.equal(f.calls.filter(x=>x==='send').length,1);
 });
 test('F06 unrelated newest turn is never used as receipt',async()=>{
   const f=fixture({unrelated:true});const r=await run(f.tools,'drain',{});

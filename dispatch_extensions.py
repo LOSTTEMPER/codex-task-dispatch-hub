@@ -187,6 +187,10 @@ class DispatchExtensions:
                               'signature':self.native_ledger_signature(row),
                               'message_hash':hashlib.sha256(message.encode()).hexdigest()}
                     self.set_meta(key, ticket)
+                    if args.get('message_chunks') is True:
+                        # Older claims may predate immutable message snapshots.
+                        self.set_meta('native_message:' + row['id'], message)
+                        return dict(self.native_message_descriptor(row), token=ticket['token'])
                     return {'thread_id':target,'message':message,'token':ticket['token']}
                 ticket = self.meta(key, {})
                 proof = args.get('proof', {})
@@ -236,4 +240,3 @@ class DispatchExtensions:
                        "proof": args["proof"], "previous_error": row["last_error"]}), row["request_id"], row["version"])
             self.db.execute("DELETE FROM meta WHERE key=?", (key,))
             return {"delivery_id": row["id"], "thread_id": target, "state": "completed", "request_unchanged": True}
-

@@ -25,6 +25,31 @@ return (async () => {
     if (response.exit_code !== 0 || !value.ok) throw new Error(value.error || "中枢命令未正常结束，账本结果待核对");
     return value.result;
   };
+  // Claims return metadata only. Immutable ASCII JSON fragments stay well below
+  // the tool output limit, regardless of the original message's token density.
+  const loadMessage = async descriptor => {
+    if (typeof descriptor.message === "string") return descriptor.message; // older hub
+    if (!Number.isSafeInteger(descriptor.message_size) || descriptor.message_size < 2 ||
+        descriptor.message_size > 2000000 || typeof descriptor.message_key !== "string") {
+      throw new Error("原领取消息元信息无效，禁止发送");
+    }
+    let encoded = "";
+    while (encoded.length < descriptor.message_size) {
+      const args = { delivery_id: descriptor.delivery_id, message_key: descriptor.message_key, offset: encoded.length };
+      let part;
+      try { part = await call("delivery_message_native", args); }
+      catch { part = await call("delivery_message_native", args); } // read same chunk, never reclaim
+      if (part.message_key !== descriptor.message_key || part.message_size !== descriptor.message_size ||
+          part.offset !== encoded.length || typeof part.chunk !== "string" || !part.chunk.length ||
+          part.next_offset !== part.offset + part.chunk.length || part.next_offset > descriptor.message_size) {
+        throw new Error("原消息分块不完整，禁止发送");
+      }
+      encoded += part.chunk;
+    }
+    const message = JSON.parse(encoded);
+    if (typeof message !== "string") throw new Error("原消息格式无效");
+    return message;
+  };
   const decode = result => {
     if (result.isError) throw new Error("原生工具未确认成功：" + String(result.content?.find(x => x.type === "text")?.text || "未提供原因").slice(0, 600));
     const block = result.content?.find(x => x.type === "text");
@@ -36,26 +61,29 @@ return (async () => {
   const findSentTurn = async (threadId, message, pages = 1) => {
     if (typeof tools.mcp__codex_app__read_thread !== "function") return null;
     let cursor;
+    const matches = new Set();
     for (let page = 0; page < pages; page++) {
       const read = decode(await tools.mcp__codex_app__read_thread({ threadId, turnLimit: 5,
-        includeOutputs: false, maxOutputCharsPerItem: Math.min(16000, message.length + 100),
+        includeOutputs: false, maxOutputCharsPerItem: message.length + 100,
         ...(cursor ? { cursor } : {}) }));
       if (read.thread?.id !== threadId || !Array.isArray(read.turns)) throw new Error("原生历史目标未知");
-      const matches = read.turns.filter(turn => typeof turn.id === "string" && turn.items?.some(item =>
+      const found = read.turns.filter(turn => typeof turn.id === "string" && turn.items?.some(item =>
         item.type === "userMessage" && Array.isArray(item.content) &&
         item.content.filter(part => part.type === "text").map(part => part.text).join("\n") === message));
-      if (matches.length > 1) throw new Error("原消息对应多个轮次，须人工核对");
-      if (matches.length === 1) return matches[0].id;
+      for (const turn of found) matches.add(turn.id);
+      if (matches.size > 1) throw new Error("原消息对应多个轮次，须人工核对");
       cursor = read.page?.nextCursor;
       if (!cursor || !read.page?.hasMore) break;
     }
-    return null;
+    return matches.size === 1 ? [...matches][0] : null;
   };
+  if (operation === 'delivery_release_native') throw new Error('未发送释放只由当前原生投递调用栈执行');
   if (operation === "delivery_link_native") {
     const keys = ["delivery_id", "expected_thread_id"];
     if (!payload || Object.keys(payload).some(key => !keys.includes(key)) ||
         keys.some(key => typeof payload[key] !== "string" || !payload[key])) throw new Error("核对只接收投递和目标编号");
-    const ticket = await call("delivery_link_native_prepare", payload);
+    const ticket = await call("delivery_link_native_prepare", { ...payload, message_chunks: true });
+    ticket.message = await loadMessage(ticket);
     const actual = await findSentTurn(ticket.thread_id, ticket.message, 3);
     if (!actual) return { result: { linked: false, error: "有界原生历史未找到原消息，保留投递，禁止重发" } };
     return { result: await call("delivery_link_native_commit", { ...payload, token: ticket.token,
@@ -143,6 +171,10 @@ return (async () => {
     if (reconcileTarget && item.thread_id !== reconcileTarget) continue;
     let claimed;
     let claimAttempted = false;
+    let sendAttempted = false;
+    let nativeConfirmed = false;
+    let actualTurn;
+    const claimToken = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
     try {
       const status = decode(await tools.mcp__codex_app__wait_threads({
         targets: [{ threadId: item.thread_id }], timeoutMs: 0
@@ -154,37 +186,61 @@ return (async () => {
         continue;
       }
       claimAttempted = true;
-      claimed = await call("delivery_claim_native", { delivery_id: item.delivery_id });
+      try {
+        claimed = await call("delivery_claim_native", { delivery_id: item.delivery_id, claim_token: claimToken, message_chunks: true });
+      } catch {
+        // A lost/truncated command reply may follow a committed claim. Recover
+        // precisely this invocation's result; never make a second claim.
+        claimed = await call("delivery_claim_native_result", { delivery_id: item.delivery_id, claim_token: claimToken });
+      }
       if (claimed.skipped) {
         outcomes.push({ delivery_id: item.delivery_id, state: claimed.state });
         claimed = undefined;
         continue;
       }
       if (claimed.thread_id !== item.thread_id) throw new Error("投递目标不一致");
+      claimed.message = await loadMessage(claimed);
+      sendAttempted = true;
       const sent = decode(await tools.mcp__codex_app__send_message_to_thread({
         threadId: claimed.thread_id, prompt: claimed.message
       }));
       if (sent.threadId !== claimed.thread_id) throw new Error("原生接收目标未确认");
-      const after = decode(await tools.mcp__codex_app__wait_threads({
-        targets: [{ threadId: claimed.thread_id }], timeoutMs: 0
-      }));
-      const actual = after.polls?.find(p => p.thread?.id === claimed.thread_id);
-      let actualTurn = sent.turnId || sent.turn?.id;
-      if (!actualTurn) {
-        try { actualTurn = await findSentTurn(claimed.thread_id, claimed.message); }
-        catch { /* Confirmed receipt remains recorded; bounded recovery is explicit. */ }
-      }
+      nativeConfirmed = true;
+      actualTurn = sent.turnId || sent.turn?.id;
+      // Persist authoritative evidence before optional status/history reads.
       await call("delivery_receipt_native", { delivery_id: item.delivery_id, confirmed: true,
         ...(actualTurn ? { turn_id: actualTurn } : {}) });
+      if (!actualTurn) {
+        try {
+          actualTurn = await findSentTurn(claimed.thread_id, claimed.message);
+          if (actualTurn) await call("delivery_receipt_native", { delivery_id: item.delivery_id, confirmed: true, turn_id: actualTurn });
+        } catch { /* Confirmed receipt remains recorded; recovery is explicit. */ }
+      }
+      let actual;
+      try {
+        const after = decode(await tools.mcp__codex_app__wait_threads({
+          targets: [{ threadId: claimed.thread_id }], timeoutMs: 0
+        }));
+        actual = after.polls?.find(p => p.thread?.id === claimed.thread_id);
+      } catch { /* Optional status cannot invalidate an authoritative receipt. */ }
       outcomes.push({ delivery_id: item.delivery_id, thread_id: claimed.thread_id,
         state: actual?.thread?.status?.type || "delivered", turn_id: actualTurn,
         ...(actualTurn ? {} : { needs_turn_link: true }) });
     } catch (error) {
+      let state = claimAttempted ? "uncertain" : "pending";
       if (claimed) {
-        try { await call("delivery_receipt_native", { delivery_id: item.delivery_id, confirmed: false }); }
-        catch { /* Keep uncertain/sending for reconciliation; never blind retry. */ }
+        try {
+          if (!sendAttempted) {
+            const released = await call("delivery_release_native", { delivery_id: item.delivery_id, claim_token: claimToken });
+            state = released.state === "pending" ? "pending" : state;
+          } else {
+            const receipt = await call("delivery_receipt_native", { delivery_id: item.delivery_id, confirmed: nativeConfirmed,
+              ...(actualTurn ? { turn_id: actualTurn } : {}) });
+            state = receipt.state || state;
+          }
+        } catch { /* Keep the original claim; never blind retry a send. */ }
       }
-      outcomes.push({ delivery_id: item.delivery_id, state: claimAttempted ? "uncertain" : "pending", error: String(error) });
+      outcomes.push({ delivery_id: item.delivery_id, state, error: String(error) });
     }
   }
   return { result: operationResult, delivery: outcomes };

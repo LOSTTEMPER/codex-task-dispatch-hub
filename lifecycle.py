@@ -4,6 +4,27 @@ import os
 from pathlib import Path
 import socket
 import threading
+import time
+
+
+def read_line(connection, limit, deadline):
+    """Bound a whole newline-terminated frame, including fragmented streams."""
+    data = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('control frame deadline exceeded')
+        connection.settimeout(remaining)
+        chunk = connection.recv(min(256, limit + 1 - len(data)))
+        if not chunk:
+            raise ConnectionError('incomplete control frame')
+        data.extend(chunk)
+        if len(data) > limit:
+            raise ValueError('control frame too large')
+        if b'\n' in data:
+            if not data.endswith(b'\n') or data.count(b'\n') != 1:
+                raise ValueError('unexpected trailing control data')
+            return bytes(data[:-1])
 
 
 class ControlEndpoint:
@@ -32,12 +53,13 @@ class ControlEndpoint:
             except OSError:
                 return
             with connection:
-                connection.settimeout(.25)
                 try:
-                    if connection.recv(16) == b'stop\n':
+                    deadline = time.monotonic() + .5
+                    if read_line(connection, 16, deadline) == b'stop':
                         self.stop()
-                        connection.sendall(json.dumps({'stop_requested': True, 'pid': os.getpid()}).encode())
-                except OSError:
+                        connection.settimeout(max(.001, deadline-time.monotonic()))
+                        connection.sendall(json.dumps({'stop_requested': True, 'pid': os.getpid()}).encode()+b'\n')
+                except (OSError, ValueError):
                     pass
 
     def close(self):
@@ -49,10 +71,12 @@ class ControlEndpoint:
 
 def request_stop(path):
     with socket.socket(socket.AF_UNIX) as connection:
+        deadline = time.monotonic() + 2
         connection.settimeout(2)
         connection.connect(str(path))
         connection.sendall(b'stop\n')
-        response = json.loads(connection.recv(1024))
-        if response.get('stop_requested') is not True:
+        connection.settimeout(max(.001, deadline-time.monotonic()))
+        response = json.loads(read_line(connection, 1024, deadline))
+        if not isinstance(response, dict) or response.get('stop_requested') is not True:
             raise RuntimeError('worker did not confirm stop request')
         return response
